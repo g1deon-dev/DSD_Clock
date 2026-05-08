@@ -7,16 +7,17 @@
 #include <RTClib.h>
 
 // ── WiFi Credentials ──────────────────────────────────────
-const char* ssid     = "Bicol University WiFi";
-const char* password = "BUp@ssw0rd";
+const char* ssid     = "HotspotTest";
+const char* password = "1234567890";
 
 // ── NTP Settings (UTC+8 Philippine Time) ──────────────────
 WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org", 28800, 60000);
+NTPClient timeClient(ntpUDP, "time.google.com", 28800, 60000);
 
 // ── RTC (DS3231) ──────────────────────────────────────────
 RTC_DS3231 rtc;
-bool rtcAvailable = false;
+bool rtcAvailable  = false;   // true if RTC chip is found on I2C
+bool rtcTimeValid  = false;   // true if RTC has a reliable time (battery OK + NTP synced)
 
 // ── Alarm Settings ────────────────────────────────────────
 const int ALARM_HOUR   = 13;
@@ -34,8 +35,9 @@ const long U_DISPLAY_DURATION  = 2000;        // show "Hello" for 2 s
 const long U_COOLDOWN_DURATION = 3000;        // cooldown before re-arm
 
 // ── LCD I2C (SDA=21, SCL=22) ──────────────────────────────
-// NOTE: If display shows garbage, change 0x27 to 0x3F
-LiquidCrystal_I2C lcd(0x27, 16, 2);
+// Address auto-detected at boot: 0x27 (PCF8574) or 0x3F (PCF8574A)
+uint8_t lcdAddr = 0x27;
+LiquidCrystal_I2C lcd(lcdAddr, 16, 2);
 
 // ── State ─────────────────────────────────────────────────
 bool alarmTriggered = false;
@@ -58,20 +60,43 @@ const char* DAYS[] = {"SUN","MON","TUE","WED","THU","FRI","SAT"};
 String pad2(int n) { return (n < 10 ? "0" : "") + String(n); }
 
 // ── Get DateTime (RTC preferred, NTP fallback) ────────────
+// Uses RTC only if chip found AND time is valid (year > 2020).
+// Falls back to NTP epoch otherwise — works even with dead battery.
 DateTime getNow() {
-  if (rtcAvailable) return rtc.now();
-  return DateTime(timeClient.getEpochTime());
+  if (rtcAvailable) {
+    DateTime t = rtc.now();
+    // RTC year 2000 means it lost power and was never set — use NTP instead
+    if (t.year() > 2020) {
+      rtcTimeValid = true;
+      return t;
+    }
+  }
+  // NTP fallback: getEpochTime() includes the UTC+8 offset we set (28800s)
+  rtcTimeValid = false;
+  unsigned long epoch = timeClient.getEpochTime();
+  if (epoch > 1000000000UL) {
+    return DateTime(epoch);
+  }
+  // NTP not ready yet — return a safe zero DateTime
+  return DateTime(2024, 1, 1, 0, 0, 0);
 }
 
 // ── Sync RTC from NTP ─────────────────────────────────────
 void syncRTCfromNTP() {
-  if (!rtcAvailable) return;
+  // Always force-refresh the NTPClient regardless of RTC presence
+  timeClient.forceUpdate();
   unsigned long epoch = timeClient.getEpochTime();
-  if (epoch > 1000000000UL) {
-    rtc.adjust(DateTime(epoch));
-    Serial.println("RTC synced from NTP.");
-  } else {
+  if (epoch <= 1000000000UL) {
     Serial.println("NTP time invalid, skipping RTC sync.");
+    return;
+  }
+  if (rtcAvailable) {
+    rtc.adjust(DateTime(epoch));
+    rtcTimeValid = true;
+    Serial.println("RTC synced from NTP. Time: " + DateTime(epoch).timestamp());
+  } else {
+    // No RTC — NTPClient is the only source; log the current time
+    Serial.println("NTP-only time: " + DateTime(epoch).timestamp());
   }
 }
 
@@ -212,11 +237,39 @@ void setup() {
   Wire.begin(21, 22);
   delay(500);
 
-  // LCD
-  lcd.init();
+  // ── I2C Scanner: find all devices, auto-detect LCD address ──
+  Serial.println("Scanning I2C bus...");
+  uint8_t foundAddr = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf("  I2C device found at 0x%02X\n", addr);
+      if (addr == 0x27 || addr == 0x3F) foundAddr = addr;
+    }
+  }
+  if (foundAddr != 0 && foundAddr != lcdAddr) {
+    lcdAddr = foundAddr;
+    lcd = LiquidCrystal_I2C(lcdAddr, 16, 2);
+    Serial.printf("LCD address updated to 0x%02X\n", lcdAddr);
+  } else if (foundAddr != 0) {
+    Serial.printf("LCD using address 0x%02X\n", lcdAddr);
+  } else {
+    Serial.println("WARNING: No LCD found on I2C bus! Check wiring.");
+  }
+
+  // ── LCD robust init (HW-61 / HD44780 needs double-init) ──
+  // Single init() sometimes fails to reset the controller fully.
+  lcd.init();       // first pass — wakes the controller
+  delay(50);
+  lcd.init();       // second pass — ensures HD44780 is fully initialized
+  delay(50);
   lcd.backlight();
+  delay(20);
   lcd.clear();
+  delay(20);
   displayMessage("Booting...", "Please wait");
+  Serial.println("LCD init done.");
+
 
   // Pins
   pinMode(SWITCH_PIN, INPUT_PULLUP);
@@ -314,11 +367,12 @@ void loop() {
     }
   }
 
-  // ── NTP → RTC sync every 60 s ───────────────────────────
-  // RTC keeps time between syncs; accurate even if WiFi dies.
-  if (WiFi.status() == WL_CONNECTED && millis() - lastNtpSync > 60000UL) {
+  // ── NTP sync every 60 s (first sync fires after 10 s) ──────────
+  // syncRTCfromNTP() now handles both RTC-present and NTP-only modes.
+  // In NTP-only mode it just refreshes the NTPClient so getEpochTime() is current.
+  unsigned long ntpInterval = (lastNtpSync == 0) ? 10000UL : 60000UL;
+  if (WiFi.status() == WL_CONNECTED && millis() - lastNtpSync > ntpInterval) {
     lastNtpSync = millis();
-    timeClient.forceUpdate();
     syncRTCfromNTP();
   }
 
