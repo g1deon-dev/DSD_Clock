@@ -20,19 +20,18 @@ bool rtcAvailable  = false;   // true if RTC chip is found on I2C
 bool rtcTimeValid  = false;   // true if RTC has a reliable time (battery OK + NTP synced)
 
 // ── Alarm Settings ────────────────────────────────────────
-const int ALARM_HOUR   = 13;
-const int ALARM_MINUTE = 17;
+const int ALARM_HOUR   = 00;
+const int ALARM_MINUTE = 10;
 
 // ── Hardware Pins ─────────────────────────────────────────
-const int SWITCH_PIN = 19;
 const int BUZZER_PIN = 18;
 
 // ── Ultrasonic Pins ───────────────────────────────────────
 const int TRIG_PIN             = 23;
 const int ECHO_PIN             = 35;
 const int DETECT_DISTANCE_CM   = 20;          // detect within 20 cm
-const long U_DISPLAY_DURATION  = 2000;        // show "Hello" for 2 s
-const long U_COOLDOWN_DURATION = 3000;        // cooldown before re-arm
+const long U_DISPLAY_DURATION  = 10000;       // scroll "Hello" for 10 s
+const long U_COOLDOWN_DURATION = 2000;        // cooldown before re-arm
 
 // ── LCD I2C (SDA=21, SCL=22) ──────────────────────────────
 // Address auto-detected at boot: 0x27 (PCF8574) or 0x3F (PCF8574A)
@@ -100,16 +99,18 @@ void syncRTCfromNTP() {
   }
 }
 
-// ── Build Row 0: military format "12:30 PM   TUE" ────────
-// Format: HH:MM XM   DOW  (16 chars total)
+// ── Build Row 0: "12:30:45 PM  TUE" ────────
+// Format: HH:MM:SS XM  DOW  (16 chars total)
 String buildTimeRow(DateTime now) {
   int h = now.hour();
   int m = now.minute();
+  int s = now.second();
   const char* ampm = (h < 12) ? "AM" : "PM";
   int h12 = h % 12;
   if (h12 == 0) h12 = 12;
   char buf[17];
-  snprintf(buf, sizeof(buf), "%02d:%02d %s   %s   ", h12, m, ampm, DAYS[now.dayOfTheWeek()]);
+  // 12:30:45 PM  TUE -> exactly 16 chars
+  snprintf(buf, sizeof(buf), "%02d:%02d:%02d %s  %s", h12, m, s, ampm, DAYS[now.dayOfTheWeek()]);
   buf[16] = '\0';
   return String(buf);
 }
@@ -152,15 +153,13 @@ void enterUltraState(UltraState s) {
   ultraStateStart = millis();
 
   if (s == U_DISPLAYING) {
-    // Row 0 keeps the clock — only row 1 changes
-    lcd.setCursor(0, 1);
-    lcd.print("  Hello, there! ");
+    // Initial print is handled dynamically in loop() to create scroll effect
     // Short beep only
     digitalWrite(BUZZER_PIN, HIGH);
     delay(100);
     digitalWrite(BUZZER_PIN, LOW);
     showingHello = true;
-    Serial.println(">> DETECTED — showing Hello on row 1, short beep");
+    Serial.println(">> DETECTED — scrolling Hello on row 1, short beep");
 
   } else if (s == U_COOLDOWN) {
     clearRow1();
@@ -193,28 +192,16 @@ void displayMessage(String row0, String row1 = "") {
 void soundAlarm() {
   lcd.clear();
   lcd.setCursor(2, 0); lcd.print("** ALARM! **");
-  lcd.setCursor(1, 1); lcd.print("Flip switch OFF!");
+  lcd.setCursor(1, 1); lcd.print(" Wake up! ");
 
   for (int burst = 0; burst < 3; burst++) {
     for (int beep = 0; beep < 4; beep++) {
-      if (digitalRead(SWITCH_PIN) == HIGH) {
-        digitalWrite(BUZZER_PIN, LOW);
-        return;
-      }
       digitalWrite(BUZZER_PIN, HIGH);
       delay(80);
       digitalWrite(BUZZER_PIN, LOW);
       delay(60);
     }
-    if (digitalRead(SWITCH_PIN) == HIGH) {
-      digitalWrite(BUZZER_PIN, LOW);
-      return;
-    }
     delay(300);
-  }
-  if (digitalRead(SWITCH_PIN) == HIGH) {
-    digitalWrite(BUZZER_PIN, LOW);
-    return;
   }
   digitalWrite(BUZZER_PIN, HIGH);
   delay(400);
@@ -258,13 +245,15 @@ void setup() {
   }
 
   // ── LCD robust init (HW-61 / HD44780 needs double-init) ──
-  // Single init() sometimes fails to reset the controller fully.
+  // HD44780 requires ≥150 ms after power-on before it accepts any
+  // commands — without this delay it boots into a garbage state.
+  delay(200);       // power-on stabilisation (critical — fixes random symbols)
   lcd.init();       // first pass — wakes the controller
   delay(50);
   lcd.init();       // second pass — ensures HD44780 is fully initialized
   delay(50);
   lcd.backlight();
-  delay(20);
+  delay(10);
   lcd.clear();
   delay(20);
   displayMessage("Booting...", "Please wait");
@@ -272,7 +261,6 @@ void setup() {
 
 
   // Pins
-  pinMode(SWITCH_PIN, INPUT_PULLUP);
   pinMode(TRIG_PIN, OUTPUT);
   digitalWrite(TRIG_PIN, LOW);
   pinMode(ECHO_PIN, INPUT);
@@ -333,19 +321,8 @@ void setup() {
 
   clockActive = true;
   lcd.clear();
-
-  // Determine initial display state from switch
-  if (digitalRead(SWITCH_PIN) == LOW) {
-    // Switch is ON
-    lcd.backlight();
-    displayOn = true;
-  } else {
-    // Switch is OFF
-    lcd.noBacklight();
-    lcd.clear();
-    displayOn = false;
-    clockActive = false;
-  }
+  lcd.backlight();
+  displayOn = true;
 
   enterUltraState(U_IDLE);
 }
@@ -374,34 +351,6 @@ void loop() {
   if (WiFi.status() == WL_CONNECTED && millis() - lastNtpSync > ntpInterval) {
     lastNtpSync = millis();
     syncRTCfromNTP();
-  }
-
-  // ── Power switch: LOW = ON (INPUT_PULLUP, switch to GND) ─
-  bool switchIsOn = (digitalRead(SWITCH_PIN) == LOW);
-
-  if (!switchIsOn) {
-    // Switch OFF → blank display, silence buzzer
-    if (displayOn) {
-      lcd.noBacklight();
-      lcd.clear();
-      displayOn   = false;
-      clockActive = false;
-      digitalWrite(BUZZER_PIN, LOW);
-      Serial.println("Switch OFF — display off.");
-    }
-    delay(50);
-    return;  // nothing else to do
-  }
-
-  // Switch ON → restore display if it was off
-  if (!displayOn) {
-    lcd.backlight();
-    lcd.clear();
-    displayOn   = true;
-    clockActive = true;
-    showingHello = false;
-    enterUltraState(U_IDLE);
-    Serial.println("Switch ON — display restored.");
   }
 
   // ── Current time from RTC ────────────────────────────────
@@ -440,10 +389,25 @@ void loop() {
     }
 
     case U_DISPLAYING: {
-      // Keep row 0 (clock) current while "Hello" shows on row 1
+      // Keep row 0 (clock) current
       showClockDisplay();
-      if (timeInUltraState() >= U_DISPLAY_DURATION) {
+      
+      unsigned long elapsed = timeInUltraState();
+      if (elapsed >= U_DISPLAY_DURATION) {
         enterUltraState(U_COOLDOWN);
+      } else {
+        // Looping Left-to-Right sliding animation
+        String text = "                Hello, there!                ";
+        int stepDelay = 170;        // 170ms per shift for a much slower, relaxed scroll
+        int totalSteps = 30;        // slide all the way across
+        int currentStep = (elapsed / stepDelay) % totalSteps;
+        
+        // Offset decreases from 29 down to 0 (makes text move Left-to-Right on screen)
+        // Once it finishes 30 steps, currentStep resets to 0, which makes it spawn back on the left!
+        int offset = 29 - currentStep;
+        
+        lcd.setCursor(0, 1);
+        lcd.print(text.substring(offset, offset + 16));
       }
       break;
     }
