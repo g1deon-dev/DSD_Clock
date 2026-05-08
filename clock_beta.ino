@@ -116,9 +116,14 @@ String buildTimeRow(DateTime now) {
 }
 
 // ── Update LCD Row 0 (time/date — always shown) ───────────
-void updateTimeRow(DateTime now) {
-  lcd.setCursor(0, 0);
-  lcd.print(buildTimeRow(now));
+void updateTimeRow(DateTime now, bool force = false) {
+  static int lastSec = -1;
+  // Only send I2C commands if the second has changed (prevents LCD corruption from I2C flooding)
+  if (now.second() != lastSec || force) {
+    lcd.setCursor(0, 0);
+    lcd.print(buildTimeRow(now));
+    lastSec = now.second();
+  }
 }
 
 // ── Clear row 1 (blank) ───────────────────────────────────
@@ -128,10 +133,10 @@ void clearRow1() {
 }
 
 // ── Full clock refresh ────────────────────────────────────
-void showClockDisplay() {
+void showClockDisplay(bool force = false) {
   if (!clockActive) return;
   DateTime now = getNow();
-  updateTimeRow(now);
+  updateTimeRow(now, force);
   // Row 1 managed by ultrasonic state machine
 }
 
@@ -169,6 +174,7 @@ void enterUltraState(UltraState s) {
   } else { // U_IDLE
     clearRow1();
     showingHello = false;
+    showClockDisplay(true); // force redraw row 0 when returning to idle
     Serial.println(">> IDLE — scanning...");
   }
 }
@@ -406,8 +412,13 @@ void loop() {
         // Once it finishes 30 steps, currentStep resets to 0, which makes it spawn back on the left!
         int offset = 29 - currentStep;
         
-        lcd.setCursor(0, 1);
-        lcd.print(text.substring(offset, offset + 16));
+        static int lastOffset = -1;
+        // Only push to LCD if the marquee actually shifted (prevents I2C flooding)
+        if (offset != lastOffset) {
+          lcd.setCursor(0, 1);
+          lcd.print(text.substring(offset, offset + 16));
+          lastOffset = offset;
+        }
       }
       break;
     }
