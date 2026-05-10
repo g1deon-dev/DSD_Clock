@@ -5,10 +5,15 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <RTClib.h>
+// ── NEW: Supabase message polling ──────────────────────────
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <queue>
+#include <set>
 
 // ── WiFi Credentials ──────────────────────────────────────
-const char* ssid     = "HotspotTest";
-const char* password = "1234567890";
+const char* ssid     = "AX53niJMR";
+const char* password = "namE8amE9";
 
 // ── NTP Settings (UTC+8 Philippine Time) ──────────────────
 WiFiUDP ntpUDP;
@@ -54,6 +59,26 @@ bool showingHello = false;
 
 // ── Day array ─────────────────────────────────────────────
 const char* DAYS[] = {"SUN","MON","TUE","WED","THU","FRI","SAT"};
+
+// ── NEW: Supabase Configuration ───────────────────────────
+const char* SUPABASE_URL = "https://vzsvojwsdwgfnwajmpxp.supabase.co";
+const char* SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZ6c3ZvandzZHdnZm53YWptcHhwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzgxMjYwMDIsImV4cCI6MjA5MzcwMjAwMn0.Ir9hHWDHkXtZXJYLop73cz1pBsgUch-6UgIThKnOqN4";
+const unsigned long POLL_INTERVAL_MS = 10000; // Poll every 10 seconds
+const unsigned long MSG_SCROLL_SPEED = 150;   // ms per scroll step (150 = smooth)
+
+// ── NEW: Message Queue ────────────────────────────────────
+struct QueuedMsg {
+  String id;
+  String content;
+};
+std::queue<QueuedMsg> msgQueue;       // FIFO queue of approved messages
+std::set<String>  queuedIds;          // IDs already queued this session (dedup guard)
+bool          msgScrolling   = false; // true while a message is being scrolled on row 1
+String        currentMsgFull = "";    // Padded full string for current scroll
+int           msgScrollPos   = 0;     // Current character offset in scroll string
+int           msgScrollRound = 0;     // How many full passes completed (stops at 3)
+unsigned long lastMsgTick    = 0;     // Timestamp of last scroll step
+unsigned long lastPoll       = 0;     // Timestamp of last Supabase poll
 
 // ── Zero-pad helper ───────────────────────────────────────
 String pad2(int n) { return (n < 10 ? "0" : "") + String(n); }
@@ -137,7 +162,7 @@ void showClockDisplay(bool force = false) {
   if (!clockActive) return;
   DateTime now = getNow();
   updateTimeRow(now, force);
-  // Row 1 managed by ultrasonic state machine
+  // Row 1 managed by ultrasonic state machine and message scroller
 }
 
 // ── HC-SR04 distance measurement ─────────────────────────
@@ -164,6 +189,8 @@ void enterUltraState(UltraState s) {
     delay(100);
     digitalWrite(BUZZER_PIN, LOW);
     showingHello = true;
+    // NEW: Reset message scroll position so it restarts cleanly after Hello finishes
+    msgScrollPos = 0;
     Serial.println(">> DETECTED — scrolling Hello on row 1, short beep");
 
   } else if (s == U_COOLDOWN) {
@@ -213,6 +240,150 @@ void soundAlarm() {
   delay(400);
   digitalWrite(BUZZER_PIN, LOW);
   lcd.clear();
+}
+
+// ── NEW: Mark a message as displayed in Supabase ──────────
+// Called immediately after fetching so it won't be re-fetched on next poll.
+void markAsDisplayed(String id) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String url = String(SUPABASE_URL) + "/rest/v1/messages?id=eq." + id;
+  http.begin(url);
+  http.addHeader("apikey", SUPABASE_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Prefer", "return=minimal");
+
+  int code = http.PATCH("{\"displayed\":true}");
+  if (code == 204 || code == 200) {
+    Serial.println("  Marked displayed: id=" + id);
+  } else {
+    Serial.println("  markAsDisplayed HTTP error: " + String(code));
+  }
+  http.end();
+}
+
+// ── NEW: Fetch approved, not-yet-displayed messages from Supabase ──
+// Adds them to msgQueue in chronological order (oldest first).
+// Immediately marks each as displayed so they won't repeat on next poll.
+void fetchApprovedMessages() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  // Filter: status=approved AND displayed=false, ordered oldest first
+  String url = String(SUPABASE_URL)
+    + "/rest/v1/messages"
+    + "?status=eq.approved"
+    + "&displayed=eq.false"
+    + "&select=id,content"
+    + "&order=created_at.asc";
+
+  http.begin(url);
+  http.addHeader("apikey", SUPABASE_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
+
+  int code = http.GET();
+  if (code == 200) {
+    String payload = http.getString();
+    Serial.println("Poll response: " + payload);
+
+    // ArduinoJson v6: DynamicJsonDocument  |  v7: JsonDocument
+    DynamicJsonDocument doc(4096);
+    DeserializationError err = deserializeJson(doc, payload);
+    if (!err) {
+      JsonArray arr = doc.as<JsonArray>();
+      for (JsonObject row : arr) {
+        String msgId      = row["id"].as<String>();
+        String msgContent = row["content"].as<String>();
+        // Dedup guard: skip if already queued this session
+        if (queuedIds.count(msgId) == 0) {
+          queuedIds.insert(msgId);
+          msgQueue.push({ msgId, msgContent });
+          Serial.println("  Queued: [" + msgId + "] " + msgContent);
+          // Mark as displayed in DB so it won't be fetched after reboot
+          markAsDisplayed(msgId);
+        } else {
+          Serial.println("  Skipped duplicate: [" + msgId + "]");
+        }
+      }
+    } else {
+      Serial.println("JSON parse error: " + String(err.c_str()));
+    }
+  } else {
+    Serial.println("Supabase poll HTTP error: " + String(code));
+  }
+  http.end();
+}
+
+// ── NEW: Advance the message scroll animation on row 1 ────
+// Only called when ultraState == U_IDLE so it never fights "Hello".
+// Scrolls right-to-left: message enters from the right edge of the display.
+// When a message finishes, the next queued message starts automatically.
+// If the queue is empty, row 1 is blank.
+void tickMessageScroll() {
+  unsigned long now = millis();
+
+  // ── Start the next message if nothing is currently scrolling ──
+  if (!msgScrolling) {
+    if (msgQueue.empty()) return;           // Nothing to show
+    QueuedMsg next = msgQueue.front();
+    msgQueue.pop();
+    // 16 leading spaces: message enters from right
+    // 16 trailing spaces: message fully exits left before round ends
+    currentMsgFull = "                " + next.content + "                ";
+    msgScrollPos   = 0;
+    msgScrollRound = 0;     // Reset round counter for each new message
+    msgScrolling   = true;
+    lastMsgTick    = now;
+    Serial.println("Scrolling message: " + next.content);
+    return; // Will display on next tick
+  }
+
+  // ── Guard: if we were paused a long time (e.g. HTTP fetch blocked),
+  //    just re-sync the tick timer and resume from current position.
+  //    Note: ultrasonic resets msgScrollPos directly in enterUltraState().
+  if (now - lastMsgTick > MSG_SCROLL_SPEED * 4) {
+    lastMsgTick = now;
+    return;
+  }
+
+  // ── Advance one scroll step ──────────────────────────────
+  if (now - lastMsgTick >= MSG_SCROLL_SPEED) {
+    lastMsgTick = now;
+
+    // Extract 16-char window, padding with spaces if near the end
+    String window = "";
+    for (int i = 0; i < 16; i++) {
+      int idx = msgScrollPos + i;
+      if (idx < (int)currentMsgFull.length()) {
+        window += currentMsgFull[idx];
+      } else {
+        window += ' ';
+      }
+    }
+
+    lcd.setCursor(0, 1);
+    lcd.print(window);
+
+    msgScrollPos++;
+
+    // ── End of one pass: either loop or stop after 3 rounds ──
+    if (msgScrollPos >= (int)currentMsgFull.length()) {
+      msgScrollRound++;
+      if (msgScrollRound >= 3) {
+        // All 3 rounds done — clear row 1 and move to next message
+        msgScrolling = false;
+        msgScrollRound = 0;
+        clearRow1();
+        Serial.println("Message scroll complete (3 rounds).");
+      } else {
+        // Start another round
+        msgScrollPos = 0;
+        Serial.println("Round " + String(msgScrollRound + 1) + " of 3...");
+      }
+    }
+  }
 }
 
 // ─────────────────────────────────────────────────────────
@@ -359,6 +530,13 @@ void loop() {
     syncRTCfromNTP();
   }
 
+  // ── NEW: Supabase poll every 10 s ────────────────────────
+  if (WiFi.status() == WL_CONNECTED && millis() - lastPoll > POLL_INTERVAL_MS) {
+    lastPoll = millis();
+    Serial.println("Polling Supabase...");
+    fetchApprovedMessages();
+  }
+
   // ── Current time from RTC ────────────────────────────────
   DateTime now = getNow();
   int h = now.hour();
@@ -386,6 +564,8 @@ void loop() {
       long dist = getDistance();
       Serial.printf("Distance: %ld cm\n", dist);
       showClockDisplay();   // keep row 0 updated
+      // NEW: Scroll approved messages on row 1 when idle
+      tickMessageScroll();
       if (dist > 0 && dist < DETECT_DISTANCE_CM) {
         // Update row 0 before switching so it's current
         updateTimeRow(getNow());
