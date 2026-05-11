@@ -11,6 +11,7 @@
 #include <MD_Parola.h>
 #include <queue>
 #include <set>
+#include <vector>
 
 // ── WiFi ──────────────────────────────────────────────────────────────────────
 const char* WIFI_SSID     = "marimar";
@@ -76,9 +77,17 @@ MD_Parola mat2(HW_TYPE, MAT2_DIN, MAT2_CLK, MAT2_CS, NUM_DEVICES);
 const uint8_t BRIGHTNESS = 0;
 
 // ── Scroll speed: lower number = FASTER scroll (ms per step internally) ───────
-const uint8_t INFO_SPEED = 50;   // mat1 scroll speed
-const uint8_t MSG_SPEED  = 45;   // mat2 message scroll speed
-const uint8_t GREET_SPEED= 55;   // mat2 greeting scroll speed
+const uint8_t INFO_SPEED  = 50;   // mat1 scroll speed
+const uint8_t MSG_SPEED   = 45;   // mat2 message scroll speed
+const uint8_t GREET_SPEED = 55;   // mat2 greeting scroll speed
+
+// ── Alarm & buzzer timing constants ──────────────────────────────────────────
+constexpr uint16_t GREET_BUZZ_MS   = 120;
+constexpr uint16_t ALARM_BEEP_ON   =  80;
+constexpr uint16_t ALARM_BEEP_OFF  =  60;
+constexpr uint16_t ALARM_BURST_GAP = 300;
+constexpr uint16_t ALARM_LONG_BUZZ = 500;
+constexpr uint8_t  ALARM_SPEED     =  35;
 
 // ── Info cycle timing ─────────────────────────────────────────────────────────
 enum InfoMode { INFO_TIME, INFO_DATE, INFO_WEATHER };
@@ -92,7 +101,7 @@ const unsigned long WX_SCROLL_MS    = 0;       // 0 = wait for scroll to finish
 bool infoScrollDone = false;    // set true by MD_Parola when scroll completes
 
 // ── Static time display refresh ───────────────────────────────────────────────
-int lastSecDisplayed = -1;
+int lastMinDisplayed = -1;   // tracks the last minute rendered (renamed from lastSecDisplayed)
 
 // ── Weather (Open-Meteo — free, no API key) ───────────────────────────────────
 // ▶ Change these to your actual location coordinates ◀
@@ -113,6 +122,7 @@ const char* SB_KEY =
   ".eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZ6c3ZvandzZHdnZm53YWptcHhwIiwi"
   "cm9sZSI6ImFub24iLCJpYXQiOjE3NzgxMjYwMDIsImV4cCI6MjA5MzcwMjAwMn0"
   ".Ir9hHWDHkXtZXJYLop73cz1pBsgUch-6UgIThKnOqN4";
+char SB_BEARER[512];   // "Bearer <key>" — built once in setup()
 
 const unsigned long POLL_MS = 10000UL;
 unsigned long lastPoll      = 0;
@@ -142,17 +152,21 @@ const char* MONTHS[] = { "JAN","FEB","MAR","APR","MAY","JUN",
 // Helper: WMO code → short weather description
 // ═════════════════════════════════════════════════════════════════════════════
 const char* wmoDesc(int c) {
-  if (c == 0)       return "Clear Sky";
-  if (c == 1)       return "Mainly Clear";
-  if (c == 2)       return "Partly Cloudy";
-  if (c == 3)       return "Overcast";
-  if (c <= 49)      return "Foggy";
-  if (c <= 57)      return "Drizzle";
-  if (c <= 67)      return "Rainy";
-  if (c <= 77)      return "Snow";
-  if (c <= 82)      return "Rain Showers";
-  if (c <= 86)      return "Snow Showers";
-  if (c <= 99)      return "Thunderstorm";
+  struct WMOEntry { int maxCode; const char* desc; };
+  static const WMOEntry WMO_TABLE[] = {
+    {0,  "Clear Sky"},
+    {1,  "Mainly Clear"},
+    {2,  "Partly Cloudy"},
+    {3,  "Overcast"},
+    {49, "Foggy"},
+    {57, "Drizzle"},
+    {67, "Rainy"},
+    {77, "Snow"},
+    {82, "Rain Showers"},
+    {86, "Snow Showers"},
+    {99, "Thunderstorm"},
+  };
+  for (const auto& e : WMO_TABLE) if (c <= e.maxCode) return e.desc;
   return "Unknown";
 }
 
@@ -184,12 +198,6 @@ void buildTimeStr(DateTime& t, char* buf, size_t len) {
   snprintf(buf, len, "%02d:%02d", t.hour(), t.minute());
 }
 
-void buildDateStr(DateTime& t, char* buf, size_t len) {
-  snprintf(buf, len, "%s %02d %s %04d",
-           DAYS[t.dayOfTheWeek()], t.day(),
-           MONTHS[t.month() - 1], t.year());
-}
-
 // ═════════════════════════════════════════════════════════════════════════════
 // Fetch weather from Open-Meteo (no API key needed)
 // ═════════════════════════════════════════════════════════════════════════════
@@ -207,8 +215,9 @@ void fetchWeather() {
   http.begin(url);
   int code = http.GET();
   if (code == 200) {
-    DynamicJsonDocument doc(2048);
-    if (!deserializeJson(doc, http.getString())) {
+    StaticJsonDocument<2048> doc;
+    WiFiClient* stream = http.getStreamPtr();
+    if (!deserializeJson(doc, *stream)) {
       wxTempC = doc["current_weather"]["temperature"].as<float>();
       wxCode  = doc["current_weather"]["weathercode"].as<int>();
       wxDesc  = wmoDesc(wxCode);
@@ -224,16 +233,23 @@ void fetchWeather() {
 // ═════════════════════════════════════════════════════════════════════════════
 // Supabase helpers
 // ═════════════════════════════════════════════════════════════════════════════
-void markDisplayed(const String& id) {
-  if (WiFi.status() != WL_CONNECTED) return;
+// Single PATCH for all newly-queued IDs — eliminates N+1 HTTP calls
+void markDisplayedBatch(const std::vector<String>& ids) {
+  if (ids.empty() || WiFi.status() != WL_CONNECTED) return;
+  String url = String(SB_URL) + "/rest/v1/messages?id=in.(";
+  for (size_t i = 0; i < ids.size(); i++) {
+    url += ids[i];
+    if (i + 1 < ids.size()) url += ",";
+  }
+  url += ")";
   HTTPClient http;
-  http.begin(String(SB_URL) + "/rest/v1/messages?id=eq." + id);
-  http.addHeader("apikey", SB_KEY);
-  http.addHeader("Authorization", String("Bearer ") + SB_KEY);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Prefer", "return=minimal");
+  http.begin(url);
+  http.addHeader("apikey",        SB_KEY);
+  http.addHeader("Authorization", SB_BEARER);
+  http.addHeader("Content-Type",  "application/json");
+  http.addHeader("Prefer",        "return=minimal");
   int c = http.PATCH("{\"displayed\":true}");
-  Serial.println("  Mark displayed [" + id + "]: HTTP " + String(c));
+  Serial.printf("  Mark displayed (%d ids): HTTP %d\n", (int)ids.size(), c);
   http.end();
 }
 
@@ -248,23 +264,28 @@ void pollSupabase() {
 
   HTTPClient http;
   http.begin(url);
-  http.addHeader("apikey", SB_KEY);
-  http.addHeader("Authorization", String("Bearer ") + SB_KEY);
+  http.addHeader("apikey",        SB_KEY);
+  http.addHeader("Authorization", SB_BEARER);
 
   int code = http.GET();
   if (code == 200) {
-    DynamicJsonDocument doc(4096);
-    if (!deserializeJson(doc, http.getString())) {
+    StaticJsonDocument<4096> doc;
+    WiFiClient* stream = http.getStreamPtr();
+    if (!deserializeJson(doc, *stream)) {
+      std::vector<String> toMark;
       for (JsonObject row : doc.as<JsonArray>()) {
         String id  = row["id"].as<String>();
         String txt = row["content"].as<String>();
         if (!seenIds.count(id)) {
           seenIds.insert(id);
+          // Cap seenIds to prevent unbounded heap growth over long uptime
+          while (seenIds.size() > 200) seenIds.erase(seenIds.begin());
           msgQ.push({ id, txt });
+          toMark.push_back(id);
           Serial.println("  Queued [" + id + "]: " + txt);
-          markDisplayed(id);
         }
       }
+      markDisplayedBatch(toMark);   // single HTTP request for all new IDs
     }
   } else {
     Serial.println("Supabase poll HTTP: " + String(code));
@@ -284,7 +305,8 @@ void mat2StartScroll(const char* text, bool isGreeting, uint8_t speed) {
   mat2Busy     = true;
   mat2Greeting = isGreeting;
   mat2IsDate   = false;
-  Serial.println("Mat2 scroll: " + String(text));
+  Serial.print("Mat2 scroll: ");
+  Serial.println(text);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -306,10 +328,9 @@ void mat2TryNextMessage() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Mat1 — Static Time Display
+// Mat1 — Static Time Display  (now receives pre-fetched DateTime)
 // ═════════════════════════════════════════════════════════════════════════════
-void mat1Tick() {
-  DateTime now = getNow();
+void mat1Tick(const DateTime& now) {
   int currentMinute = now.minute();
 
   // displayAnimate() MUST be called every loop.
@@ -319,9 +340,10 @@ void mat1Tick() {
   // displayReset which briefly blanks the panel and reveals stuck pixels).
   bool done = mat1.displayAnimate();
 
-  if (done || currentMinute != lastSecDisplayed) {
-    lastSecDisplayed = currentMinute;
-    buildTimeStr(now, mat1Buf, sizeof(mat1Buf));
+  if (done || currentMinute != lastMinDisplayed) {
+    lastMinDisplayed = currentMinute;
+    // cast away const — buildTimeStr only reads the DateTime
+    buildTimeStr(const_cast<DateTime&>(now), mat1Buf, sizeof(mat1Buf));
     // Long pause (60 s) keeps the text static without constantly re-rendering
     mat1.displayText(mat1Buf, PA_CENTER, 0, 60000, PA_NO_EFFECT, PA_NO_EFFECT);
   }
@@ -334,7 +356,7 @@ long getDistance() {
   digitalWrite(TRIG_PIN, LOW);  delayMicroseconds(2);
   digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
-  long dur = pulseIn(ECHO_PIN, HIGH, 30000);
+  long dur = pulseIn(ECHO_PIN, HIGH, 6000);  // 6 ms covers ~100 cm; was 30 ms
   return dur ? (long)(dur * 0.034f / 2.0f) : 999L;
 }
 
@@ -346,7 +368,7 @@ void enterUState(UltraState s) {
   uStateStart = millis();
 
   if (s == U_GREETING) {
-    digitalWrite(BUZZER_PIN, HIGH); delay(120); digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(BUZZER_PIN, HIGH); delay(GREET_BUZZ_MS); digitalWrite(BUZZER_PIN, LOW);
     mat2StartScroll("Hello, there!   Welcome!", true, GREET_SPEED);
     Serial.println(">> Greeting started");
 
@@ -371,19 +393,21 @@ void soundAlarm() {
   static char alarmBuf2[] = "!! ALARM !!  Wake up!  Wake up!  ";
 
   mat1.displayClear();
-  mat1.displayScroll(alarmBuf1, PA_LEFT, PA_SCROLL_LEFT, 35);
+  mat1.displayScroll(alarmBuf1, PA_LEFT, PA_SCROLL_LEFT, ALARM_SPEED);
   mat2.displayClear();
-  mat2.displayScroll(alarmBuf2, PA_LEFT, PA_SCROLL_LEFT, 35);
+  mat2.displayScroll(alarmBuf2, PA_LEFT, PA_SCROLL_LEFT, ALARM_SPEED);
 
   for (int burst = 0; burst < 3; burst++) {
     for (int beep = 0; beep < 4; beep++) {
       mat1.displayAnimate(); mat2.displayAnimate();
-      digitalWrite(BUZZER_PIN, HIGH); delay(80);
-      digitalWrite(BUZZER_PIN, LOW);  delay(60);
+      digitalWrite(BUZZER_PIN, HIGH); delay(ALARM_BEEP_ON);  yield();
+      digitalWrite(BUZZER_PIN, LOW);  delay(ALARM_BEEP_OFF); yield();
     }
-    delay(300);
+    mat1.displayAnimate(); mat2.displayAnimate();
+    delay(ALARM_BURST_GAP); yield();
   }
-  digitalWrite(BUZZER_PIN, HIGH); delay(500); digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(BUZZER_PIN, HIGH); delay(ALARM_LONG_BUZZ); yield();
+  digitalWrite(BUZZER_PIN, LOW);
   mat1.displayClear(); mat2.displayClear();
 }
 
@@ -391,8 +415,8 @@ void soundAlarm() {
 // Boot splash — scroll a string on the given matrix and wait for it to finish
 // ═════════════════════════════════════════════════════════════════════════════
 void bootSplash(MD_Parola& m, const char* text, uint8_t speed = 50) {
-  char buf[64];   // local buffer — NOT static, so mat1 and mat2 never share it
-  strncpy(buf, text, 63); buf[63] = '\0';
+  char buf[128];   // local buffer — NOT static, so mat1 and mat2 never share it
+  strncpy(buf, text, sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0';
   m.displayClear();
   m.displayScroll(buf, PA_LEFT, PA_SCROLL_LEFT, speed);
   while (!m.displayAnimate()) { /* spin */ }
@@ -449,6 +473,9 @@ void setup() {
     bootSplash(mat1, " No RTC  NTP only ");
   }
 
+  // ── Build Supabase bearer string once (avoids String concat on every HTTP call)
+  snprintf(SB_BEARER, sizeof(SB_BEARER), "Bearer %s", SB_KEY);
+
   // ── WiFi ──────────────────────────────────────────────────────────────────
   bootSplash(mat1, " Connecting WiFi... ");
 
@@ -486,7 +513,7 @@ void setup() {
     DateTime now = getNow();
     buildTimeStr(now, mat1Buf, sizeof(mat1Buf));
     mat1.displayText(mat1Buf, PA_CENTER, 0, 0, PA_NO_EFFECT, PA_NO_EFFECT);
-    lastSecDisplayed = now.minute();
+    lastMinDisplayed = now.minute();
     infoMode = INFO_TIME;
     infoModeStart = millis();
   }
@@ -501,56 +528,56 @@ void setup() {
 void loop() {
   static unsigned long lastWifiCheck = 0;
   static unsigned long lastNtpSync   = 0;
+  static bool          ntpSynced     = false;
+
+  // Cache WiFi status once — avoids redundant driver calls per tick
+  bool wifiOK = (WiFi.status() == WL_CONNECTED);
 
   // ── WiFi watchdog ─────────────────────────────────────────────────────────
   if (millis() - lastWifiCheck > 30000) {
     lastWifiCheck = millis();
-    if (WiFi.status() != WL_CONNECTED) {
+    if (!wifiOK) {
       Serial.println("WiFi lost. Reconnecting...");
-      WiFi.disconnect();
+      WiFi.disconnect(true);
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     }
   }
 
   // ── NTP sync (10 s after boot, then every 60 s) ───────────────────────────
-  unsigned long ntpInt = lastNtpSync ? 60000UL : 10000UL;
-  if (WiFi.status() == WL_CONNECTED && millis() - lastNtpSync > ntpInt) {
+  unsigned long ntpInt = ntpSynced ? 60000UL : 10000UL;
+  if (wifiOK && millis() - lastNtpSync > ntpInt) {
     lastNtpSync = millis();
+    ntpSynced   = true;
     syncRTC();
   }
 
   // ── Weather refresh every 10 min ──────────────────────────────────────────
-  if (WiFi.status() == WL_CONNECTED && millis() - lastWxFetch > WX_INTERVAL) {
+  if (wifiOK && millis() - lastWxFetch > WX_INTERVAL) {
     lastWxFetch = millis();
     fetchWeather();
   }
 
-  // ── Supabase poll every 10 s ──────────────────────────────────────────────
-  if (WiFi.status() == WL_CONNECTED && millis() - lastPoll > POLL_MS) {
+  if (wifiOK && millis() - lastPoll > POLL_MS) {
     lastPoll = millis();
     pollSupabase();
   }
 
-  // ── Alarm check ───────────────────────────────────────────────────────────
-  {
-    DateTime now = getNow();
-    if (!(now.hour() == ALARM_HOUR && now.minute() == ALARM_MINUTE))
-      alarmTriggered = false;
+  // Fetch time ONCE and share across the whole tick (saves I2C reads)
+  DateTime now = getNow();
 
-    if (now.hour() == ALARM_HOUR && now.minute() == ALARM_MINUTE
-        && now.second() < 10 && !alarmTriggered) {
-      alarmTriggered = true;
-      soundAlarm();
-      // Reset both displays after alarm
-      lastSecDisplayed = -1;
-      mat2Busy = false; mat2Greeting = false; mat2IsDate = false;
-      mat2.displayClear();
-      enterUState(U_IDLE);
-    }
+  // ── Alarm check ───────────────────────────────────────────────────────────
+  bool isAlarmTime = (now.hour() == ALARM_HOUR && now.minute() == ALARM_MINUTE);
+  if (!isAlarmTime) alarmTriggered = false;
+  if (isAlarmTime && now.second() < 10 && !alarmTriggered) {
+    alarmTriggered = true;
+    soundAlarm();
+    lastMinDisplayed = -1;
+    mat2Busy = false; mat2Greeting = false; mat2IsDate = false;
+    mat2.displayClear();
+    enterUState(U_IDLE);
   }
 
-  // ── Mat1: info cycle ──────────────────────────────────────────────────────
-  mat1Tick();
+  mat1Tick(now);
 
   // ── Mat2: message / greeting / date ───────────────────────────────────────
   if (mat2Busy) {
@@ -589,8 +616,7 @@ void loop() {
       if (!msgQ.empty()) {
         mat2TryNextMessage();
       } else {
-        // Alternating date (scrolling) and day (static)
-        DateTime now = getNow();
+        // Alternating date (scrolling) and day (static) — reuse pre-fetched now
         if (!mat2DateToggle) {
           // Scroll full date
           snprintf(mat2Buf, sizeof(mat2Buf), "%02d/%02d/%04d",
