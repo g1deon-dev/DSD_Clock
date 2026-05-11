@@ -12,8 +12,8 @@
 #include <set>
 
 // ── WiFi Credentials ──────────────────────────────────────
-const char* ssid     = "AX53niJMR";
-const char* password = "namE8amE9";
+const char* ssid     = "marimar";
+const char* password = "martin061106";
 
 // ── NTP Settings (UTC+8 Philippine Time) ──────────────────
 WiFiUDP ntpUDP;
