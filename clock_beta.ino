@@ -640,18 +640,18 @@ void loop() {
   switch (uState) {
 
     case U_IDLE: {
+      // Server messages take priority: hold off the sensor until the
+      // message finishes all its scroll passes.
+      bool serverMsgActive = mat2Busy && !mat2Greeting && !mat2IsDate;
+      if (serverMsgActive) break;   // skip detection while a message is scrolling
+
       long dist = getDistance();
       if (dist > 0 && dist < DETECT_CM) {
-        // Object detected — trigger greeting
-        // Interrupt any scrolling message (it will resume after cooldown)
-        if (mat2Busy && !mat2Greeting) {
-          if (mat2IsDate) {
-            mat2IsDate = false;
-          } else {
-            // Re-queue the current message so it's not lost
-            msgQ.push({ "", mat2CurText });   // empty id = already marked in DB
-            mat2Passes = 0;
-          }
+        // Object detected — trigger greeting.
+        // Only a date display can be on mat2 here (server messages are blocked above),
+        // so just clear the date flag; no message needs to be re-queued.
+        if (mat2Busy && mat2IsDate) {
+          mat2IsDate = false;
         }
         enterUState(U_GREETING);
       }
