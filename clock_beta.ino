@@ -13,8 +13,8 @@
 #include <vector>
 
 // ── WiFi ──────────────────────────────────────────────────────────────────────
-const char* WIFI_SSID     = "PLDTHOMEFIBRGP56x";
-const char* WIFI_PASSWORD = "MAdl061106";
+const char* WIFI_SSID     = "AX53niJMR";
+const char* WIFI_PASSWORD = "namE8amE9";
 
 // ── NTP (UTC+8 Philippine Time) ───────────────────────────────────────────────
 WiFiUDP ntpUDP;
@@ -102,6 +102,28 @@ const char* SB_KEY =
 const unsigned long POLL_MS = 10000UL;
 unsigned long lastPoll      = 0;
 
+// ── WiFi & Network timing constants (magic numbers converted) ────────────────
+const unsigned long WIFI_CHECK_INTERVAL = 30000UL;      // WiFi check every 30s
+const unsigned long WIFI_TIMEOUT = 15000UL;             // WiFi connection timeout
+const unsigned long WIFI_RECONNECT_INITIAL = 5000UL;    // Start with 5s backoff
+const unsigned long WIFI_RECONNECT_MAX = 120000UL;      // Max 2min backoff
+const unsigned long NTP_SYNC_FAST = 10000UL;            // Fast sync when not synced (10s)
+const unsigned long NTP_SYNC_NORMAL = 3600000UL;        // Normal sync every 1 hour (was 60s)
+const unsigned long BOOT_TIMEOUT = 400;                 // Boot delay
+const unsigned long I2C_INIT_DELAY = 300;               // I2C initialization delay
+const unsigned int SERIAL_BAUD = 115200;                // Serial baud rate
+const unsigned long SEMAPHORE_TIMEOUT = 500UL;          // Semaphore timeout (500ms)
+
+// ── Error Logging Macro ────────────────────────────────────────────────────────
+#define LOG_ERROR(msg) Serial.print("[ERROR] "); Serial.println(msg);
+#define LOG_WARN(msg)  Serial.print("[WARN]  "); Serial.println(msg);
+#define LOG_INFO(msg)  Serial.print("[INFO]  "); Serial.println(msg);
+
+// ── WiFi Backoff State ─────────────────────────────────────────────────────────
+unsigned long wifiReconnectBackoff = WIFI_RECONNECT_INITIAL;
+unsigned long lastWifiAttempt = 0;
+bool wifiConnected = false;
+
 // ── Message queue for mat2 ────────────────────────────────────────────────────
 struct Msg { String id; String text; };
 std::queue<Msg> msgQ;
@@ -133,10 +155,13 @@ const char* MONTHS[] = { "JAN","FEB","MAR","APR","MAY","JUN",
 // ═════════════════════════════════════════════════════════════════════════════
 DateTime getNow() {
   if (rtcAvailable) {
-    xSemaphoreTake(i2cMutex, portMAX_DELAY);
-    DateTime t = rtc.now();
-    xSemaphoreGive(i2cMutex);
-    if (t.year() > 2020) return t;
+    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(SEMAPHORE_TIMEOUT)) == pdTRUE) {
+      DateTime t = rtc.now();
+      xSemaphoreGive(i2cMutex);
+      if (t.year() > 2020) return t;
+    } else {
+      LOG_WARN("RTC read timeout");
+    }
   }
   unsigned long ep = timeClient.getEpochTime();
   return (ep > 1000000000UL) ? DateTime(ep) : DateTime(2024, 1, 1, 0, 0, 0);
@@ -147,9 +172,12 @@ void syncRTC() {
   unsigned long ep = timeClient.getEpochTime();
   if (ep <= 1000000000UL) { Serial.println("NTP invalid."); return; }
   if (rtcAvailable) {
-    xSemaphoreTake(i2cMutex, portMAX_DELAY);
-    rtc.adjust(DateTime(ep));
-    xSemaphoreGive(i2cMutex);
+    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(SEMAPHORE_TIMEOUT)) == pdTRUE) {
+      rtc.adjust(DateTime(ep));
+      xSemaphoreGive(i2cMutex);
+    } else {
+      LOG_WARN("RTC sync timeout");
+    }
   }
   Serial.println("Time synced: " + DateTime(ep).timestamp());
 }
@@ -203,11 +231,14 @@ void pollSupabase() {
         String txt = row["content"].as<String>();
         if (!seenIds.count(id)) {
           seenIds.insert(id);
-          xSemaphoreTake(msgMutex, portMAX_DELAY);
-          msgQ.push({ id, txt });
-          xSemaphoreGive(msgMutex);
-          Serial.println("  Queued [" + id + "]: " + txt);
-          markDisplayed(id);
+          if (xSemaphoreTake(msgMutex, pdMS_TO_TICKS(SEMAPHORE_TIMEOUT)) == pdTRUE) {
+            msgQ.push({ id, txt });
+            xSemaphoreGive(msgMutex);
+            Serial.println("  Queued [" + id + "]: " + txt);
+            markDisplayed(id);
+          } else {
+            LOG_WARN("Mutex timeout queueing message");
+          }
         }
       }
     }
@@ -237,7 +268,10 @@ void mat2StartScroll(const char* text, bool isGreeting, uint8_t speed) {
 // Mat2 — try to start the next message from queue
 // ═════════════════════════════════════════════════════════════════════════════
 void mat2TryNextMessage() {
-  xSemaphoreTake(msgMutex, portMAX_DELAY);
+  if (xSemaphoreTake(msgMutex, pdMS_TO_TICKS(SEMAPHORE_TIMEOUT)) != pdTRUE) {
+    LOG_WARN("Mutex timeout in mat2TryNextMessage");
+    return;
+  }
   if (msgQ.empty()) {
     xSemaphoreGive(msgMutex);
     mat2Busy = false;
@@ -432,14 +466,38 @@ void setup() {
   bootSplash(mat2, "  Please wait...  ");
 
   // ── I2C + RTC ─────────────────────────────────────────────────────────────
+  Serial.println("Initializing I2C...");
   Wire.begin(21, 22);
-  delay(300);
-  if (rtc.begin(&Wire)) {
-    rtcAvailable = true;
-    Serial.println("RTC found: " + rtc.now().timestamp());
-    if (rtc.lostPower()) Serial.println("RTC lost power — will sync from NTP.");
+  delay(I2C_INIT_DELAY);
+  
+  Serial.println("Scanning I2C bus...");
+  // Quick I2C scan to detect RTC before attempting to initialize
+  Wire.beginTransmission(0x68);  // DS3231 address
+  int error = Wire.endTransmission();
+  
+  if (error == 0) {
+    Serial.println("RTC detected on I2C bus");
+    if (rtc.begin(&Wire)) {
+      rtcAvailable = true;
+      DateTime rtcTime = rtc.now();
+      Serial.println("RTC initialized: " + rtcTime.timestamp());
+      
+      char rtcDisplay[32];
+      snprintf(rtcDisplay, sizeof(rtcDisplay), " %02d:%02d:%02d ", rtcTime.hour(), rtcTime.minute(), rtcTime.second());
+      bootSplash(mat1, rtcDisplay);
+      
+      Serial.println("RTC time: " + String(rtcTime.hour()) + ":" + String(rtcTime.minute()) + ":" + String(rtcTime.second()));
+      if (rtc.lostPower()) {
+        Serial.println("RTC lost power — will sync from NTP.");
+        bootSplash(mat1, " RTC Power Lost ");
+      }
+    } else {
+      Serial.println("RTC begin() failed despite I2C presence");
+      rtcAvailable = false;
+      bootSplash(mat1, " RTC Init Error ");
+    }
   } else {
-    Serial.println("No RTC — NTP only.");
+    Serial.println("RTC not detected on I2C — NTP only");
     bootSplash(mat1, " No RTC  NTP only ");
   }
 
@@ -451,22 +509,41 @@ void setup() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   unsigned long wStart = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wStart < 15000) {
-    delay(500); Serial.print(".");
+  while (WiFi.status() != WL_CONNECTED && millis() - wStart < WIFI_TIMEOUT) {
+    delay(500);
+    Serial.print(".");
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi OK: " + WiFi.localIP().toString());
-    char ipMsg[40];
-    snprintf(ipMsg, sizeof(ipMsg), " WiFi OK  IP:%s  ",
-             WiFi.localIP().toString().c_str());
-    bootSplash(mat1, ipMsg);
+    wifiConnected = true;
+    int rssi = WiFi.RSSI();
+    Serial.println("\nWiFi OK: " + WiFi.localIP().toString() + " (RSSI: " + String(rssi) + "dBm)");
+    
+    bootSplash(mat1, " WiFi OK ");
+    
+    // Show WiFi signal strength
+    char signalMsg[32];
+    if (rssi > -50) {
+      snprintf(signalMsg, sizeof(signalMsg), " Signal: Excellent ");
+    } else if (rssi > -60) {
+      snprintf(signalMsg, sizeof(signalMsg), " Signal: Good ");
+    } else if (rssi > -70) {
+      snprintf(signalMsg, sizeof(signalMsg), " Signal: Fair ");
+    } else {
+      snprintf(signalMsg, sizeof(signalMsg), " Signal: Weak ");
+    }
+    bootSplash(mat2, signalMsg);
+    Serial.println("WiFi Signal: " + String(rssi) + " dBm");
 
     timeClient.begin();
+    Serial.println("Starting NTP sync...");
+    bootSplash(mat1, " Syncing NTP... ");
     syncRTC();
+    bootSplash(mat2, " NTP OK  Ready! ");
   } else {
     Serial.println("\nWiFi timeout!");
     bootSplash(mat1, " No WiFi!  Offline ");
+    bootSplash(mat2, " NTP Only Mode ");
   }
 
   // ── Ready ─────────────────────────────────────────────────────────────────
@@ -510,9 +587,10 @@ void loop() {
   mat1Tick(now);
 
   bool hasMessages = false;
-  xSemaphoreTake(msgMutex, portMAX_DELAY);
-  hasMessages = !msgQ.empty();
-  xSemaphoreGive(msgMutex);
+  if (xSemaphoreTake(msgMutex, pdMS_TO_TICKS(SEMAPHORE_TIMEOUT)) == pdTRUE) {
+    hasMessages = !msgQ.empty();
+    xSemaphoreGive(msgMutex);
+  }
 
   bool showingMessage = (mat2Busy && !mat2IsDate && !mat2Greeting);
   bool disableUltrasonic = (hasMessages || showingMessage);
