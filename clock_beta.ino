@@ -1,4 +1,3 @@
-
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -14,8 +13,8 @@
 #include <vector>
 
 // ── WiFi ──────────────────────────────────────────────────────────────────────
-const char* WIFI_SSID     = "marimar";
-const char* WIFI_PASSWORD = "martin061106";
+const char* WIFI_SSID     = "PLDTHOMEFIBRGP56x";
+const char* WIFI_PASSWORD = "MAdl061106";
 
 // ── NTP (UTC+8 Philippine Time) ───────────────────────────────────────────────
 WiFiUDP ntpUDP;
@@ -26,8 +25,8 @@ RTC_DS3231 rtc;
 bool rtcAvailable = false;
 
 // ── Alarm ─────────────────────────────────────────────────────────────────────
-const int ALARM_HOUR   = 0;
-const int ALARM_MINUTE = 10;
+const int ALARM_HOUR   = 16;
+const int ALARM_MINUTE = 40;
 bool alarmTriggered = false;
 
 // ── GPIO ──────────────────────────────────────────────────────────────────────
@@ -89,31 +88,8 @@ constexpr uint16_t ALARM_BURST_GAP = 300;
 constexpr uint16_t ALARM_LONG_BUZZ = 500;
 constexpr uint8_t  ALARM_SPEED     =  35;
 
-// ── Info cycle timing ─────────────────────────────────────────────────────────
-enum InfoMode { INFO_TIME, INFO_DATE, INFO_WEATHER };
-InfoMode      infoMode      = INFO_TIME;
-unsigned long infoModeStart = 0;
-
-const unsigned long TIME_HOLD_MS    = 6000;   // static time shown for 6 s
-const unsigned long DATE_SCROLL_MS  = 0;       // 0 = wait for scroll to finish
-const unsigned long WX_SCROLL_MS    = 0;       // 0 = wait for scroll to finish
-
-bool infoScrollDone = false;    // set true by MD_Parola when scroll completes
-
 // ── Static time display refresh ───────────────────────────────────────────────
 int lastMinDisplayed = -1;   // tracks the last minute rendered (renamed from lastSecDisplayed)
-
-// ── Weather (Open-Meteo — free, no API key) ───────────────────────────────────
-// ▶ Change these to your actual location coordinates ◀
-const float  WX_LAT = 14.5995f;
-const float  WX_LON = 120.9842f;
-
-const unsigned long WX_INTERVAL = 600000UL;   // refresh every 10 min
-unsigned long lastWxFetch = 0;
-float  wxTempC  = 0.0f;
-int    wxCode   = 0;
-String wxDesc   = "---";
-bool   wxValid  = false;
 
 // ── Supabase ──────────────────────────────────────────────────────────────────
 const char* SB_URL = "https://vzsvojwsdwgfnwajmpxp.supabase.co";
@@ -122,7 +98,6 @@ const char* SB_KEY =
   ".eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZ6c3ZvandzZHdnZm53YWptcHhwIiwi"
   "cm9sZSI6ImFub24iLCJpYXQiOjE3NzgxMjYwMDIsImV4cCI6MjA5MzcwMjAwMn0"
   ".Ir9hHWDHkXtZXJYLop73cz1pBsgUch-6UgIThKnOqN4";
-char SB_BEARER[512];   // "Bearer <key>" — built once in setup()
 
 const unsigned long POLL_MS = 10000UL;
 unsigned long lastPoll      = 0;
@@ -131,6 +106,9 @@ unsigned long lastPoll      = 0;
 struct Msg { String id; String text; };
 std::queue<Msg> msgQ;
 std::set<String> seenIds;
+
+SemaphoreHandle_t msgMutex;
+SemaphoreHandle_t i2cMutex;
 
 bool   mat2Busy     = false;
 bool   mat2Greeting = false;
@@ -148,34 +126,16 @@ const char* DAYS[]   = { "SUN","MON","TUE","WED","THU","FRI","SAT" };
 const char* MONTHS[] = { "JAN","FEB","MAR","APR","MAY","JUN",
                           "JUL","AUG","SEP","OCT","NOV","DEC" };
 
-// ═════════════════════════════════════════════════════════════════════════════
-// Helper: WMO code → short weather description
-// ═════════════════════════════════════════════════════════════════════════════
-const char* wmoDesc(int c) {
-  struct WMOEntry { int maxCode; const char* desc; };
-  static const WMOEntry WMO_TABLE[] = {
-    {0,  "Clear Sky"},
-    {1,  "Mainly Clear"},
-    {2,  "Partly Cloudy"},
-    {3,  "Overcast"},
-    {49, "Foggy"},
-    {57, "Drizzle"},
-    {67, "Rainy"},
-    {77, "Snow"},
-    {82, "Rain Showers"},
-    {86, "Snow Showers"},
-    {99, "Thunderstorm"},
-  };
-  for (const auto& e : WMO_TABLE) if (c <= e.maxCode) return e.desc;
-  return "Unknown";
-}
+
 
 // ═════════════════════════════════════════════════════════════════════════════
 // RTC / NTP helpers
 // ═════════════════════════════════════════════════════════════════════════════
 DateTime getNow() {
   if (rtcAvailable) {
+    xSemaphoreTake(i2cMutex, portMAX_DELAY);
     DateTime t = rtc.now();
+    xSemaphoreGive(i2cMutex);
     if (t.year() > 2020) return t;
   }
   unsigned long ep = timeClient.getEpochTime();
@@ -186,7 +146,11 @@ void syncRTC() {
   timeClient.forceUpdate();
   unsigned long ep = timeClient.getEpochTime();
   if (ep <= 1000000000UL) { Serial.println("NTP invalid."); return; }
-  if (rtcAvailable) rtc.adjust(DateTime(ep));
+  if (rtcAvailable) {
+    xSemaphoreTake(i2cMutex, portMAX_DELAY);
+    rtc.adjust(DateTime(ep));
+    xSemaphoreGive(i2cMutex);
+  }
   Serial.println("Time synced: " + DateTime(ep).timestamp());
 }
 
@@ -198,58 +162,21 @@ void buildTimeStr(DateTime& t, char* buf, size_t len) {
   snprintf(buf, len, "%02d:%02d", t.hour(), t.minute());
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-// Fetch weather from Open-Meteo (no API key needed)
-// ═════════════════════════════════════════════════════════════════════════════
-void fetchWeather() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  char url[256];
-  snprintf(url, sizeof(url),
-    "https://api.open-meteo.com/v1/forecast"
-    "?latitude=%.4f&longitude=%.4f"
-    "&current_weather=true"
-    "&temperature_unit=celsius",
-    WX_LAT, WX_LON);
 
-  HTTPClient http;
-  http.begin(url);
-  int code = http.GET();
-  if (code == 200) {
-    StaticJsonDocument<2048> doc;
-    WiFiClient* stream = http.getStreamPtr();
-    if (!deserializeJson(doc, *stream)) {
-      wxTempC = doc["current_weather"]["temperature"].as<float>();
-      wxCode  = doc["current_weather"]["weathercode"].as<int>();
-      wxDesc  = wmoDesc(wxCode);
-      wxValid = true;
-      Serial.printf("Weather: %.1f°C  %s\n", wxTempC, wxDesc.c_str());
-    }
-  } else {
-    Serial.println("Weather HTTP: " + String(code));
-  }
-  http.end();
-}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Supabase helpers
 // ═════════════════════════════════════════════════════════════════════════════
-// Single PATCH for all newly-queued IDs — eliminates N+1 HTTP calls
-void markDisplayedBatch(const std::vector<String>& ids) {
-  if (ids.empty() || WiFi.status() != WL_CONNECTED) return;
-  String url = String(SB_URL) + "/rest/v1/messages?id=in.(";
-  for (size_t i = 0; i < ids.size(); i++) {
-    url += ids[i];
-    if (i + 1 < ids.size()) url += ",";
-  }
-  url += ")";
+void markDisplayed(const String& id) {
+  if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
-  http.begin(url);
-  http.addHeader("apikey",        SB_KEY);
-  http.addHeader("Authorization", SB_BEARER);
-  http.addHeader("Content-Type",  "application/json");
-  http.addHeader("Prefer",        "return=minimal");
+  http.begin(String(SB_URL) + "/rest/v1/messages?id=eq." + id);
+  http.addHeader("apikey", SB_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SB_KEY);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Prefer", "return=minimal");
   int c = http.PATCH("{\"displayed\":true}");
-  Serial.printf("  Mark displayed (%d ids): HTTP %d\n", (int)ids.size(), c);
+  Serial.println("  Mark displayed [" + id + "]: HTTP " + String(c));
   http.end();
 }
 
@@ -264,28 +191,25 @@ void pollSupabase() {
 
   HTTPClient http;
   http.begin(url);
-  http.addHeader("apikey",        SB_KEY);
-  http.addHeader("Authorization", SB_BEARER);
+  http.addHeader("apikey", SB_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SB_KEY);
 
   int code = http.GET();
   if (code == 200) {
-    StaticJsonDocument<4096> doc;
-    WiFiClient* stream = http.getStreamPtr();
-    if (!deserializeJson(doc, *stream)) {
-      std::vector<String> toMark;
+    DynamicJsonDocument doc(4096);
+    if (!deserializeJson(doc, http.getString())) {
       for (JsonObject row : doc.as<JsonArray>()) {
         String id  = row["id"].as<String>();
         String txt = row["content"].as<String>();
         if (!seenIds.count(id)) {
           seenIds.insert(id);
-          // Cap seenIds to prevent unbounded heap growth over long uptime
-          while (seenIds.size() > 200) seenIds.erase(seenIds.begin());
+          xSemaphoreTake(msgMutex, portMAX_DELAY);
           msgQ.push({ id, txt });
-          toMark.push_back(id);
+          xSemaphoreGive(msgMutex);
           Serial.println("  Queued [" + id + "]: " + txt);
+          markDisplayed(id);
         }
       }
-      markDisplayedBatch(toMark);   // single HTTP request for all new IDs
     }
   } else {
     Serial.println("Supabase poll HTTP: " + String(code));
@@ -313,7 +237,9 @@ void mat2StartScroll(const char* text, bool isGreeting, uint8_t speed) {
 // Mat2 — try to start the next message from queue
 // ═════════════════════════════════════════════════════════════════════════════
 void mat2TryNextMessage() {
+  xSemaphoreTake(msgMutex, portMAX_DELAY);
   if (msgQ.empty()) {
+    xSemaphoreGive(msgMutex);
     mat2Busy = false;
     mat2IsDate = false;
     mat2.displayClear();
@@ -321,6 +247,8 @@ void mat2TryNextMessage() {
   }
   Msg next = msgQ.front();
   msgQ.pop();
+  xSemaphoreGive(msgMutex);
+
   mat2CurText = next.text;
   mat2Passes  = 0;
   mat2IsDate  = false;
@@ -386,23 +314,62 @@ void enterUState(UltraState s) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// Network Task (Core 0)
+// ═════════════════════════════════════════════════════════════════════════════
+void networkTask(void *pvParameters) {
+  unsigned long lastWifiCheck = 0;
+  unsigned long lastNtpSync   = 0;
+  unsigned long lastPoll      = 0;
+  bool          ntpSynced     = true;
+
+  for (;;) {
+    bool wifiOK = (WiFi.status() == WL_CONNECTED);
+
+    if (millis() - lastWifiCheck > 30000) {
+      lastWifiCheck = millis();
+      if (!wifiOK) {
+        Serial.println("WiFi lost. Reconnecting...");
+        WiFi.disconnect(true);
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      }
+    }
+
+    if (wifiOK) {
+      unsigned long ntpInt = ntpSynced ? 60000UL : 10000UL;
+      if (millis() - lastNtpSync > ntpInt) {
+        lastNtpSync = millis();
+        ntpSynced   = true;
+        syncRTC();
+      }
+
+      if (millis() - lastPoll > POLL_MS) {
+        lastPoll = millis();
+        pollSupabase();
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // Alarm sequence (beeps + both matrices show alarm text)
 // ═════════════════════════════════════════════════════════════════════════════
-void soundAlarm() {
-  static char alarmBuf1[] = "** ALARM **  Wake up!  Wake up!  ";
+void soundAlarm(const DateTime& now) {
+  buildTimeStr(const_cast<DateTime&>(now), mat1Buf, sizeof(mat1Buf));
   static char alarmBuf2[] = "!! ALARM !!  Wake up!  Wake up!  ";
 
-  mat1.displayClear();
-  mat1.displayScroll(alarmBuf1, PA_LEFT, PA_SCROLL_LEFT, ALARM_SPEED);
   mat2.displayClear();
   mat2.displayScroll(alarmBuf2, PA_LEFT, PA_SCROLL_LEFT, ALARM_SPEED);
 
   for (int burst = 0; burst < 3; burst++) {
+    mat1.displayClear();
+    mat1.displayText(mat1Buf, PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
     for (int beep = 0; beep < 4; beep++) {
       mat1.displayAnimate(); mat2.displayAnimate();
       digitalWrite(BUZZER_PIN, HIGH); delay(ALARM_BEEP_ON);  yield();
       digitalWrite(BUZZER_PIN, LOW);  delay(ALARM_BEEP_OFF); yield();
     }
+    mat1.displayClear();
     mat1.displayAnimate(); mat2.displayAnimate();
     delay(ALARM_BURST_GAP); yield();
   }
@@ -441,6 +408,9 @@ void setup() {
   delay(400);
   Serial.println("\n\n=== DUAL NH1088AS MATRIX BOOT ===");
 
+  msgMutex = xSemaphoreCreateMutex();
+  i2cMutex = xSemaphoreCreateMutex();
+
   // ── Ultrasonic ────────────────────────────────────────────────────────────
   pinMode(TRIG_PIN, OUTPUT); digitalWrite(TRIG_PIN, LOW);
   pinMode(ECHO_PIN, INPUT);
@@ -473,9 +443,6 @@ void setup() {
     bootSplash(mat1, " No RTC  NTP only ");
   }
 
-  // ── Build Supabase bearer string once (avoids String concat on every HTTP call)
-  snprintf(SB_BEARER, sizeof(SB_BEARER), "Bearer %s", SB_KEY);
-
   // ── WiFi ──────────────────────────────────────────────────────────────────
   bootSplash(mat1, " Connecting WiFi... ");
 
@@ -497,8 +464,6 @@ void setup() {
 
     timeClient.begin();
     syncRTC();
-    fetchWeather();
-    lastWxFetch = millis();
   } else {
     Serial.println("\nWiFi timeout!");
     bootSplash(mat1, " No WiFi!  Offline ");
@@ -514,11 +479,13 @@ void setup() {
     buildTimeStr(now, mat1Buf, sizeof(mat1Buf));
     mat1.displayText(mat1Buf, PA_CENTER, 0, 0, PA_NO_EFFECT, PA_NO_EFFECT);
     lastMinDisplayed = now.minute();
-    infoMode = INFO_TIME;
-    infoModeStart = millis();
   }
 
   enterUState(U_IDLE);
+
+  // Start the background network task on Core 0
+  xTaskCreatePinnedToCore(networkTask, "NetworkTask", 8192, NULL, 1, NULL, 0);
+
   Serial.println("Setup complete. Running...");
 }
 
@@ -526,43 +493,6 @@ void setup() {
 // LOOP
 // ═════════════════════════════════════════════════════════════════════════════
 void loop() {
-  static unsigned long lastWifiCheck = 0;
-  static unsigned long lastNtpSync   = 0;
-  static bool          ntpSynced     = false;
-
-  // Cache WiFi status once — avoids redundant driver calls per tick
-  bool wifiOK = (WiFi.status() == WL_CONNECTED);
-
-  // ── WiFi watchdog ─────────────────────────────────────────────────────────
-  if (millis() - lastWifiCheck > 30000) {
-    lastWifiCheck = millis();
-    if (!wifiOK) {
-      Serial.println("WiFi lost. Reconnecting...");
-      WiFi.disconnect(true);
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    }
-  }
-
-  // ── NTP sync (10 s after boot, then every 60 s) ───────────────────────────
-  unsigned long ntpInt = ntpSynced ? 60000UL : 10000UL;
-  if (wifiOK && millis() - lastNtpSync > ntpInt) {
-    lastNtpSync = millis();
-    ntpSynced   = true;
-    syncRTC();
-  }
-
-  // ── Weather refresh every 10 min ──────────────────────────────────────────
-  if (wifiOK && millis() - lastWxFetch > WX_INTERVAL) {
-    lastWxFetch = millis();
-    fetchWeather();
-  }
-
-  if (wifiOK && millis() - lastPoll > POLL_MS) {
-    lastPoll = millis();
-    pollSupabase();
-  }
-
-  // Fetch time ONCE and share across the whole tick (saves I2C reads)
   DateTime now = getNow();
 
   // ── Alarm check ───────────────────────────────────────────────────────────
@@ -570,7 +500,7 @@ void loop() {
   if (!isAlarmTime) alarmTriggered = false;
   if (isAlarmTime && now.second() < 10 && !alarmTriggered) {
     alarmTriggered = true;
-    soundAlarm();
+    soundAlarm(now);
     lastMinDisplayed = -1;
     mat2Busy = false; mat2Greeting = false; mat2IsDate = false;
     mat2.displayClear();
@@ -579,52 +509,63 @@ void loop() {
 
   mat1Tick(now);
 
+  bool hasMessages = false;
+  xSemaphoreTake(msgMutex, portMAX_DELAY);
+  hasMessages = !msgQ.empty();
+  xSemaphoreGive(msgMutex);
+
+  bool showingMessage = (mat2Busy && !mat2IsDate && !mat2Greeting);
+  bool disableUltrasonic = (hasMessages || showingMessage);
+
   // ── Mat2: message / greeting / date ───────────────────────────────────────
   if (mat2Busy) {
     bool done = mat2.displayAnimate();
 
     if (done) {
       if (mat2Greeting) {
-        // Greeting scrolled once — return to idle / next message
         mat2Greeting = false;
         mat2Busy     = false;
         mat2.displayClear();
         if (uState == U_GREETING) enterUState(U_COOLDOWN);
-
+        
+        if (hasMessages) mat2TryNextMessage();
       } else if (mat2IsDate) {
-        // Date finished its 3s pause.
         mat2IsDate = false;
         mat2Busy   = false;
-        mat2DateToggle = !mat2DateToggle; // Flip between date and day
+        mat2DateToggle = !mat2DateToggle;
         mat2.displayClear();
 
+        if (hasMessages) mat2TryNextMessage();
       } else {
-        // Supabase message — scroll up to 3 passes
         mat2Passes++;
         if (mat2Passes < 3) {
-          // Restart same message for another pass
           mat2StartScroll(mat2CurText.c_str(), false, MSG_SPEED);
         } else {
           Serial.println("Message done (3 passes).");
           mat2TryNextMessage();
         }
       }
+    } else {
+      if (hasMessages && (mat2IsDate || mat2Greeting)) {
+         mat2Greeting = false;
+         mat2IsDate = false;
+         mat2Busy = false;
+         mat2.displayClear();
+         if (uState == U_GREETING) enterUState(U_IDLE);
+         mat2TryNextMessage();
+      }
     }
   } else {
-    // Idle: start next queued message if available, else show static date
     if (uState == U_IDLE) {
-      if (!msgQ.empty()) {
+      if (hasMessages) {
         mat2TryNextMessage();
       } else {
-        // Alternating date (scrolling) and day (static) — reuse pre-fetched now
         if (!mat2DateToggle) {
-          // Scroll full date
           snprintf(mat2Buf, sizeof(mat2Buf), "%02d/%02d/%04d",
                    now.month(), now.day(), now.year());
           mat2.displayClear();
           mat2.displayScroll(mat2Buf, PA_LEFT, PA_SCROLL_LEFT, INFO_SPEED);
         } else {
-          // Static Day
           snprintf(mat2Buf, sizeof(mat2Buf), "%s", DAYS[now.dayOfTheWeek()]);
           mat2.displayClear();
           mat2.displayText(mat2Buf, PA_CENTER, 0, 3000, PA_NO_EFFECT, PA_NO_EFFECT);
@@ -637,46 +578,36 @@ void loop() {
   }
 
   // ── Ultrasonic state machine ──────────────────────────────────────────────
-  switch (uState) {
-
-    case U_IDLE: {
-      // Server messages take priority: hold off the sensor until the
-      // message finishes all its scroll passes.
-      bool serverMsgActive = mat2Busy && !mat2Greeting && !mat2IsDate;
-      if (serverMsgActive) break;   // skip detection while a message is scrolling
-
-      long dist = getDistance();
-      if (dist > 0 && dist < DETECT_CM) {
-        // Object detected — trigger greeting.
-        // Only a date display can be on mat2 here (server messages are blocked above),
-        // so just clear the date flag; no message needs to be re-queued.
-        if (mat2Busy && mat2IsDate) {
-          mat2IsDate = false;
+  if (!disableUltrasonic) {
+    switch (uState) {
+      case U_IDLE: {
+        long dist = getDistance();
+        if (dist > 0 && dist < DETECT_CM) {
+          enterUState(U_GREETING);
         }
-        enterUState(U_GREETING);
+        break;
       }
-      break;
-    }
-
-    case U_GREETING: {
-      // Safety timeout — if greeting somehow stalls, move on
-      if (millis() - uStateStart > GREET_MS + 4000) {
-        mat2Greeting = false;
-        mat2Busy     = false;
-        mat2.displayClear();
-        enterUState(U_COOLDOWN);
+      case U_GREETING: {
+        if (millis() - uStateStart > GREET_MS + 4000) {
+          mat2Greeting = false;
+          mat2Busy     = false;
+          mat2.displayClear();
+          enterUState(U_COOLDOWN);
+        }
+        break;
       }
-      break;
+      case U_COOLDOWN: {
+        if (millis() - uStateStart >= COOLDOWN_MS) {
+          enterUState(U_IDLE);
+        }
+        break;
+      }
     }
-
-    case U_COOLDOWN: {
-      if (millis() - uStateStart >= COOLDOWN_MS) {
+  } else {
+    if (uState != U_IDLE) {
         enterUState(U_IDLE);
-      }
-      break;
     }
   }
 
-  // Small yield to prevent watchdog resets on ESP32
   delay(5);
 }
