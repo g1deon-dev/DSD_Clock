@@ -13,8 +13,10 @@
 #include <vector>
 
 // ── WiFi ──────────────────────────────────────────────────────────────────────
-const char* WIFI_SSID     = "AX53niJMR";
-const char* WIFI_PASSWORD = "namE8amE9";
+//const char* WIFI_SSID     = "AX53niJMR";
+//const char* WIFI_PASSWORD = "namE8amE9";
+const char* WIFI_SSID     = "Dormitory";
+const char* WIFI_PASSWORD = "Budorms1969";
 
 // ── NTP (UTC+8 Philippine Time) ───────────────────────────────────────────────
 WiFiUDP ntpUDP;
@@ -114,6 +116,17 @@ const unsigned long I2C_INIT_DELAY = 300;               // I2C initialization de
 const unsigned int SERIAL_BAUD = 115200;                // Serial baud rate
 const unsigned long SEMAPHORE_TIMEOUT = 500UL;          // Semaphore timeout (500ms)
 
+// ── Safety constants for message handling & memory protection ─────────────────
+const size_t MAX_MSG_LENGTH = 150;                        // Max message chars (buffer overflow protection)
+const size_t MAX_SEEN_IDS = 500;                          // Max entries in seenIds set
+const unsigned long DATE_TOGGLE_MS = 15000UL;             // Time-based date toggle (was state-based)
+const uint16_t I2C_TIMEOUT_MS = 100;                      // I2C operation timeout
+
+// ── State variables for robustness ───────────────────────────────────────────
+bool mat2GreetingCancelled = false;                       // Flag: greeting interrupted by message
+unsigned long lastDateToggleTime = 0;                     // Timestamp of last date toggle
+static DateTime lastGoodTime = DateTime(2024, 1, 1, 0, 0, 0);  // Fallback time if all sources fail
+
 // ── Error Logging Macro ────────────────────────────────────────────────────────
 #define LOG_ERROR(msg) Serial.print("[ERROR] "); Serial.println(msg);
 #define LOG_WARN(msg)  Serial.print("[WARN]  "); Serial.println(msg);
@@ -158,13 +171,22 @@ DateTime getNow() {
     if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(SEMAPHORE_TIMEOUT)) == pdTRUE) {
       DateTime t = rtc.now();
       xSemaphoreGive(i2cMutex);
-      if (t.year() > 2020) return t;
+      if (t.year() > 2020) {
+        lastGoodTime = t;  // Update fallback time
+        return t;
+      }
     } else {
       LOG_WARN("RTC read timeout");
     }
   }
   unsigned long ep = timeClient.getEpochTime();
-  return (ep > 1000000000UL) ? DateTime(ep) : DateTime(2024, 1, 1, 0, 0, 0);
+  if (ep > 1000000000UL) {
+    DateTime dt(ep);
+    lastGoodTime = dt;  // Update fallback time
+    return dt;
+  }
+  // Both RTC and NTP failed: return last-known-good time
+  return lastGoodTime;
 }
 
 void syncRTC() {
@@ -198,6 +220,7 @@ void buildTimeStr(DateTime& t, char* buf, size_t len) {
 void markDisplayed(const String& id) {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
+  http.setTimeout(5000);  // 5-second timeout prevents hanging
   http.begin(String(SB_URL) + "/rest/v1/messages?id=eq." + id);
   http.addHeader("apikey", SB_KEY);
   http.addHeader("Authorization", String("Bearer ") + SB_KEY);
@@ -218,6 +241,7 @@ void pollSupabase() {
     + "&order=created_at.asc";
 
   HTTPClient http;
+  http.setTimeout(5000);  // 5-second timeout prevents hanging
   http.begin(url);
   http.addHeader("apikey", SB_KEY);
   http.addHeader("Authorization", String("Bearer ") + SB_KEY);
@@ -229,8 +253,28 @@ void pollSupabase() {
       for (JsonObject row : doc.as<JsonArray>()) {
         String id  = row["id"].as<String>();
         String txt = row["content"].as<String>();
+        
+        // Validate message length to prevent buffer overflow
+        if (txt.length() > MAX_MSG_LENGTH) {
+          txt = txt.substring(0, MAX_MSG_LENGTH);
+          LOG_WARN("Message truncated to " + String(MAX_MSG_LENGTH) + " chars");
+        }
+        
         if (!seenIds.count(id)) {
           seenIds.insert(id);
+          
+          // Cleanup seenIds if it grows too large (memory leak prevention)
+          if (seenIds.size() > MAX_SEEN_IDS) {
+            Serial.println("[WARN] seenIds at " + String(seenIds.size()) + " entries, clearing oldest 50%");
+            // Create temporary set with newest half of IDs
+            std::set<String> newSeenIds;
+            int count = 0;
+            for (auto it = seenIds.rbegin(); it != seenIds.rend() && count < MAX_SEEN_IDS / 2; ++it, ++count) {
+              newSeenIds.insert(*it);
+            }
+            seenIds = newSeenIds;
+          }
+          
           if (xSemaphoreTake(msgMutex, pdMS_TO_TICKS(SEMAPHORE_TIMEOUT)) == pdTRUE) {
             msgQ.push({ id, txt });
             xSemaphoreGive(msgMutex);
@@ -252,6 +296,12 @@ void pollSupabase() {
 // Mat2 — start a scroll pass
 // ═════════════════════════════════════════════════════════════════════════════
 void mat2StartScroll(const char* text, bool isGreeting, uint8_t speed) {
+  // Validate text length to prevent buffer overflow
+  if (!text || strlen(text) == 0) {
+    LOG_WARN("mat2StartScroll: empty text");
+    return;
+  }
+  
   strncpy(mat2Buf, text, sizeof(mat2Buf) - 1);
   mat2Buf[sizeof(mat2Buf) - 1] = '\0';
   mat2.displayClear();
@@ -272,6 +322,13 @@ void mat2TryNextMessage() {
     LOG_WARN("Mutex timeout in mat2TryNextMessage");
     return;
   }
+  
+  // If alarm is running, hold all queued messages until alarm finishes
+  if (alarmTriggered) {
+    xSemaphoreGive(msgMutex);
+    return;
+  }
+  
   if (msgQ.empty()) {
     xSemaphoreGive(msgMutex);
     mat2Busy = false;
@@ -302,6 +359,11 @@ void mat1Tick(const DateTime& now) {
   // displayReset which briefly blanks the panel and reveals stuck pixels).
   bool done = mat1.displayAnimate();
 
+  // Detect time jump (e.g., after NTP sync) — force refresh if minute changed by >1
+  if (abs(currentMinute - lastMinDisplayed) > 1) {
+    lastMinDisplayed = -1;  // Force refresh
+  }
+
   if (done || currentMinute != lastMinDisplayed) {
     lastMinDisplayed = currentMinute;
     // cast away const — buildTimeStr only reads the DateTime
@@ -318,7 +380,7 @@ long getDistance() {
   digitalWrite(TRIG_PIN, LOW);  delayMicroseconds(2);
   digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
-  long dur = pulseIn(ECHO_PIN, HIGH, 6000);  // 6 ms covers ~100 cm; was 30 ms
+  long dur = pulseIn(ECHO_PIN, HIGH, 30000);  // 30ms covers ~500cm (increased from 6ms to improve range)
   return dur ? (long)(dur * 0.034f / 2.0f) : 999L;
 }
 
@@ -348,6 +410,22 @@ void enterUState(UltraState s) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// I2C timeout wrapper (prevents infinite hangs on stuck bus)
+// ═════════════════════════════════════════════════════════════════════════════
+bool i2cReadByte(uint8_t addr, uint8_t& value, uint16_t timeout_ms = 100) {
+  unsigned long start = millis();
+  Wire.beginTransmission(addr);
+  while (Wire.endTransmission() == 4) {  // 4 = other error / unknown
+    if (millis() - start > timeout_ms) {
+      LOG_ERROR("I2C timeout for device 0x" + String(addr, HEX));
+      return false;
+    }
+    delay(1);
+  }
+  return true;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // Network Task (Core 0)
 // ═════════════════════════════════════════════════════════════════════════════
 void networkTask(void *pvParameters) {
@@ -358,6 +436,7 @@ void networkTask(void *pvParameters) {
 
   for (;;) {
     bool wifiOK = (WiFi.status() == WL_CONNECTED);
+    wifiConnected = wifiOK;  // Update global state (FIX: was never updated)
 
     if (millis() - lastWifiCheck > 30000) {
       lastWifiCheck = millis();
@@ -386,27 +465,35 @@ void networkTask(void *pvParameters) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Alarm sequence (beeps + both matrices show alarm text)
+// Alarm sequence (blinking time on row 1, static ALARM on row 2)
 // ═════════════════════════════════════════════════════════════════════════════
 void soundAlarm(const DateTime& now) {
   buildTimeStr(const_cast<DateTime&>(now), mat1Buf, sizeof(mat1Buf));
-  static char alarmBuf2[] = "!! ALARM !!  Wake up!  Wake up!  ";
+  static char alarmBuf2[] = "  ALARM!!  ";
 
+  mat1.displayClear();
   mat2.displayClear();
-  mat2.displayScroll(alarmBuf2, PA_LEFT, PA_SCROLL_LEFT, ALARM_SPEED);
+  // Display static "ALARM!!" on mat2 (row 2) — no scrolling
+  mat2.displayText(alarmBuf2, PA_CENTER, 0, 0, PA_NO_EFFECT, PA_NO_EFFECT);
 
   for (int burst = 0; burst < 3; burst++) {
-    mat1.displayClear();
-    mat1.displayText(mat1Buf, PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
     for (int beep = 0; beep < 4; beep++) {
+      // Blink time on mat1 (row 1) — display
+      mat1.displayText(mat1Buf, PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
       mat1.displayAnimate(); mat2.displayAnimate();
       digitalWrite(BUZZER_PIN, HIGH); delay(ALARM_BEEP_ON);  yield();
+      
+      // Clear mat1 (blink off)
+      mat1.displayClear();
       digitalWrite(BUZZER_PIN, LOW);  delay(ALARM_BEEP_OFF); yield();
+      mat1.displayAnimate(); mat2.displayAnimate();
     }
-    mat1.displayClear();
-    mat1.displayAnimate(); mat2.displayAnimate();
+    // Gap between bursts
     delay(ALARM_BURST_GAP); yield();
   }
+  // Final long buzz — show time
+  mat1.displayText(mat1Buf, PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
+  mat1.displayAnimate(); mat2.displayAnimate();
   digitalWrite(BUZZER_PIN, HIGH); delay(ALARM_LONG_BUZZ); yield();
   digitalWrite(BUZZER_PIN, LOW);
   mat1.displayClear(); mat2.displayClear();
@@ -471,11 +558,9 @@ void setup() {
   delay(I2C_INIT_DELAY);
   
   Serial.println("Scanning I2C bus...");
-  // Quick I2C scan to detect RTC before attempting to initialize
-  Wire.beginTransmission(0x68);  // DS3231 address
-  int error = Wire.endTransmission();
-  
-  if (error == 0) {
+  // Use I2C timeout wrapper to detect RTC before attempting to initialize (prevents hangs)
+  uint8_t dummy = 0;
+  if (i2cReadByte(0x68, dummy, I2C_TIMEOUT_MS)) {
     Serial.println("RTC detected on I2C bus");
     if (rtc.begin(&Wire)) {
       rtcAvailable = true;
@@ -538,7 +623,7 @@ void setup() {
     timeClient.begin();
     Serial.println("Starting NTP sync...");
     bootSplash(mat1, " Syncing NTP... ");
-    syncRTC();
+    syncRTC();  // Pre-sync RTC from NTP before messages start processing (FIX: ensures time is current)
     bootSplash(mat2, " NTP OK  Ready! ");
   } else {
     Serial.println("\nWiFi timeout!");
@@ -577,10 +662,19 @@ void loop() {
   if (!isAlarmTime) alarmTriggered = false;
   if (isAlarmTime && now.second() < 10 && !alarmTriggered) {
     alarmTriggered = true;
+    
+    // Acquire mutex before forcing mat2 clear (prevents race with networkTask)
+    if (xSemaphoreTake(msgMutex, pdMS_TO_TICKS(SEMAPHORE_TIMEOUT)) == pdTRUE) {
+      mat2Busy = false;
+      mat2Greeting = false;
+      mat2IsDate = false;
+      mat2GreetingCancelled = false;
+      mat2.displayClear();
+      xSemaphoreGive(msgMutex);
+    }
+    
     soundAlarm(now);
     lastMinDisplayed = -1;
-    mat2Busy = false; mat2Greeting = false; mat2IsDate = false;
-    mat2.displayClear();
     enterUState(U_IDLE);
   }
 
@@ -603,6 +697,7 @@ void loop() {
       if (mat2Greeting) {
         mat2Greeting = false;
         mat2Busy     = false;
+        mat2GreetingCancelled = false;
         mat2.displayClear();
         if (uState == U_GREETING) enterUState(U_COOLDOWN);
         
@@ -610,8 +705,12 @@ void loop() {
       } else if (mat2IsDate) {
         mat2IsDate = false;
         mat2Busy   = false;
-        mat2DateToggle = !mat2DateToggle;
         mat2.displayClear();
+        // Only toggle if enough time has passed (prevents stuck toggle state)
+        if (millis() - lastDateToggleTime > DATE_TOGGLE_MS) {
+          mat2DateToggle = !mat2DateToggle;
+          lastDateToggleTime = millis();
+        }
 
         if (hasMessages) mat2TryNextMessage();
       } else {
@@ -624,10 +723,12 @@ void loop() {
         }
       }
     } else {
-      if (hasMessages && (mat2IsDate || mat2Greeting)) {
+      // Message interrupted by greeting cancellation or new message arrival
+      if (hasMessages && (mat2IsDate || (mat2Greeting && mat2GreetingCancelled))) {
          mat2Greeting = false;
          mat2IsDate = false;
          mat2Busy = false;
+         mat2GreetingCancelled = false;
          mat2.displayClear();
          if (uState == U_GREETING) enterUState(U_IDLE);
          mat2TryNextMessage();
@@ -638,7 +739,10 @@ void loop() {
       if (hasMessages) {
         mat2TryNextMessage();
       } else {
-        if (!mat2DateToggle) {
+        // Time-based date toggle prevents stuck states
+        bool shouldShowDate = !mat2DateToggle || (millis() - lastDateToggleTime < DATE_TOGGLE_MS / 2);
+        
+        if (shouldShowDate) {
           snprintf(mat2Buf, sizeof(mat2Buf), "%02d/%02d/%04d",
                    now.month(), now.day(), now.year());
           mat2.displayClear();
@@ -667,6 +771,7 @@ void loop() {
       }
       case U_GREETING: {
         if (millis() - uStateStart > GREET_MS + 4000) {
+          mat2GreetingCancelled = true;  // Mark greeting as done
           mat2Greeting = false;
           mat2Busy     = false;
           mat2.displayClear();
