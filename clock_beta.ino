@@ -15,8 +15,10 @@
 // ── WiFi ──────────────────────────────────────────────────────────────────────
 //const char* WIFI_SSID     = "AX53niJMR";
 //const char* WIFI_PASSWORD = "namE8amE9";
-const char* WIFI_SSID     = "Dormitory";
-const char* WIFI_PASSWORD = "Budorms1969";
+//const char* WIFI_SSID     = "Dormitory";
+//const char* WIFI_PASSWORD = "Budorms1969";
+const char* WIFI_SSID     = "hotspot";
+const char* WIFI_PASSWORD = "BUp@ssw0rd";
 
 // ── NTP (UTC+8 Philippine Time) ───────────────────────────────────────────────
 WiFiUDP ntpUDP;
@@ -27,8 +29,8 @@ RTC_DS3231 rtc;
 bool rtcAvailable = false;
 
 // ── Alarm ─────────────────────────────────────────────────────────────────────
-const int ALARM_HOUR   = 16;
-const int ALARM_MINUTE = 40;
+const int ALARM_HOUR   = 11;
+const int ALARM_MINUTE = 45;
 bool alarmTriggered = false;
 
 // ── GPIO ──────────────────────────────────────────────────────────────────────
@@ -151,6 +153,9 @@ bool   mat2IsDate   = false;
 bool   mat2DateToggle = false; // toggles between "05/11/26" and "MON"
 int    mat2Passes   = 0;       // count scroll passes for the current message
 String mat2CurText  = "";
+String mat2SavedMsgId = "";    // saved message ID when alarm interrupts
+String mat2SavedMsgText = "";  // saved message text when alarm interrupts
+bool   mat2MsgInterruptedByAlarm = false;  // flag: message was interrupted by alarm
 
 // Static buffer for Parola (must persist while animating)
 static char mat2Buf[128];
@@ -465,38 +470,50 @@ void networkTask(void *pvParameters) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Alarm sequence (blinking time on row 1, static ALARM on row 2)
+// Alarm sequence (blinking time on row 1, centered ALARM on row 2)
 // ═════════════════════════════════════════════════════════════════════════════
 void soundAlarm(const DateTime& now) {
   buildTimeStr(const_cast<DateTime&>(now), mat1Buf, sizeof(mat1Buf));
-  static char alarmBuf2[] = "  ALARM!!  ";
+  static char alarmBuf2[] = "ALARM";
 
   mat1.displayClear();
   mat2.displayClear();
-  // Display static "ALARM!!" on mat2 (row 2) — no scrolling
-  mat2.displayText(alarmBuf2, PA_CENTER, 0, 0, PA_NO_EFFECT, PA_NO_EFFECT);
+  
+  // Set mat2 alignment to center for alarm message
+  mat2.setTextAlignment(PA_CENTER);
+  mat2.displayText(alarmBuf2, PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
 
   for (int burst = 0; burst < 3; burst++) {
     for (int beep = 0; beep < 4; beep++) {
-      // Blink time on mat1 (row 1) — display
+      // Blink time on mat1 (row 1) — display ON
+      mat1.setTextAlignment(PA_CENTER);
       mat1.displayText(mat1Buf, PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
       mat1.displayAnimate(); mat2.displayAnimate();
       digitalWrite(BUZZER_PIN, HIGH); delay(ALARM_BEEP_ON);  yield();
       
-      // Clear mat1 (blink off)
+      // Blink time OFF — clear and animate
       mat1.displayClear();
+      mat1.displayAnimate();  // Execute the clear
       digitalWrite(BUZZER_PIN, LOW);  delay(ALARM_BEEP_OFF); yield();
-      mat1.displayAnimate(); mat2.displayAnimate();
+      mat2.displayAnimate();  // Keep mat2 animated
     }
     // Gap between bursts
     delay(ALARM_BURST_GAP); yield();
   }
+  
   // Final long buzz — show time
   mat1.displayText(mat1Buf, PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
   mat1.displayAnimate(); mat2.displayAnimate();
   digitalWrite(BUZZER_PIN, HIGH); delay(ALARM_LONG_BUZZ); yield();
   digitalWrite(BUZZER_PIN, LOW);
-  mat1.displayClear(); mat2.displayClear();
+  
+  // Reset alignments and clear displays
+  mat1.setTextAlignment(PA_LEFT);
+  mat2.setTextAlignment(PA_LEFT);
+  mat1.displayClear(); 
+  mat2.displayClear();
+  mat1.displayAnimate();
+  mat2.displayAnimate();
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -663,6 +680,15 @@ void loop() {
   if (isAlarmTime && now.second() < 10 && !alarmTriggered) {
     alarmTriggered = true;
     
+    // Save current message if one is being displayed (not greeting, not date)
+    if (mat2Busy && !mat2Greeting && !mat2IsDate && mat2CurText.length() > 0) {
+      mat2SavedMsgText = mat2CurText;
+      mat2MsgInterruptedByAlarm = true;
+      Serial.println("Message interrupted by alarm: " + mat2SavedMsgText);
+    } else {
+      mat2MsgInterruptedByAlarm = false;
+    }
+    
     // Acquire mutex before forcing mat2 clear (prevents race with networkTask)
     if (xSemaphoreTake(msgMutex, pdMS_TO_TICKS(SEMAPHORE_TIMEOUT)) == pdTRUE) {
       mat2Busy = false;
@@ -676,6 +702,31 @@ void loop() {
     soundAlarm(now);
     lastMinDisplayed = -1;
     enterUState(U_IDLE);
+    
+    // After alarm finishes, restore interrupted message to front of queue
+    if (mat2MsgInterruptedByAlarm) {
+      if (xSemaphoreTake(msgMutex, pdMS_TO_TICKS(SEMAPHORE_TIMEOUT)) == pdTRUE) {
+        // Re-queue the interrupted message at the front
+        Msg interruptedMsg;
+        interruptedMsg.text = mat2SavedMsgText;
+        interruptedMsg.id = "restored_after_alarm";
+        
+        // Create a new queue with the restored message at the front
+        std::queue<Msg> tempQ;
+        tempQ.push(interruptedMsg);
+        while (!msgQ.empty()) {
+          tempQ.push(msgQ.front());
+          msgQ.pop();
+        }
+        msgQ = tempQ;
+        
+        xSemaphoreGive(msgMutex);
+        Serial.println("Restored message to queue after alarm");
+      }
+      mat2MsgInterruptedByAlarm = false;
+    }
+    
+    alarmTriggered = false;
   }
 
   mat1Tick(now);
