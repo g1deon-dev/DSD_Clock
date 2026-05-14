@@ -15,8 +15,8 @@
 // ── WiFi ──────────────────────────────────────────────────────────────────────
 //const char* WIFI_SSID     = "AX53niJMR";
 //const char* WIFI_PASSWORD = "namE8amE9";
-const char* WIFI_SSID     = "Dormitory";
-const char* WIFI_PASSWORD = "Budorms1969";
+const char* WIFI_SSID     = "Bicol University WiFi";
+const char* WIFI_PASSWORD = "BUp@ssw0rd";
 
 // ── NTP (UTC+8 Philippine Time) ───────────────────────────────────────────────
 WiFiUDP ntpUDP;
