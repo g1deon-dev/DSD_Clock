@@ -1,4 +1,6 @@
 #include <WiFi.h>
+#include <WiFiManager.h>
+#include <ArduinoOTA.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <NTPClient.h>
@@ -12,13 +14,16 @@
 #include <set>
 #include <vector>
 
-// ── WiFi ──────────────────────────────────────────────────────────────────────
-//const char* WIFI_SSID     = "AX53niJMR";
-//const char* WIFI_PASSWORD = "namE8amE9";
-//const char* WIFI_SSID     = "Dormitory";
-//const char* WIFI_PASSWORD = "Budorms1969";
-const char* WIFI_SSID     = "hotspot";
-const char* WIFI_PASSWORD = "BUp@ssw0rd";
+// ── WiFi provisioning (Library Manager: "WiFiManager" by tzapu) ───────────────
+// First boot (or no saved network): join AP WIFI_AP_NAME, open captive portal, pick home Wi‑Fi.
+// Change WIFI_AP_PASSWORD and OTA_UPLOAD_PASSWORD before sealing the device (min 8 chars for AP WPA).
+const char* const WIFI_AP_NAME         = "ClockSetup";
+const char* const WIFI_AP_PASSWORD     = "PortalChg1";  // join ClockSetup with this password; change it
+const unsigned long WIFI_PORTAL_SEC    = 300;          // portal max time if STA connect fails (0 = never)
+
+// OTA: same password in firmware and in Arduino IDE when uploading over network
+const char* const OTA_UPLOAD_PASSWORD  = "clock-ota-change-me";
+
 
 // ── NTP (UTC+8 Philippine Time) ───────────────────────────────────────────────
 WiFiUDP ntpUDP;
@@ -29,8 +34,8 @@ RTC_DS3231 rtc;
 bool rtcAvailable = false;
 
 // ── Alarm ─────────────────────────────────────────────────────────────────────
-const int ALARM_HOUR   = 11;
-const int ALARM_MINUTE = 45;
+const int ALARM_HOUR   = 19;
+const int ALARM_MINUTE = 11;
 bool alarmTriggered = false;
 
 // ── GPIO ──────────────────────────────────────────────────────────────────────
@@ -431,6 +436,34 @@ bool i2cReadByte(uint8_t addr, uint8_t& value, uint16_t timeout_ms = 100) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// OTA (Arduino IDE: same LAN → Tools → Port → clock-beta at …)
+// ═════════════════════════════════════════════════════════════════════════════
+void beginArduinoOTA() {
+  ArduinoOTA.setHostname("clock-beta");
+  if (OTA_UPLOAD_PASSWORD != nullptr && OTA_UPLOAD_PASSWORD[0] != '\0') {
+    ArduinoOTA.setPassword(OTA_UPLOAD_PASSWORD);
+  }
+  ArduinoOTA
+    .onStart([]() {
+      Serial.println(String("[OTA] start ") +
+                     ((ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem"));
+    })
+    .onEnd([]() { Serial.println("[OTA] end"); })
+    .onProgress([](unsigned int progress, unsigned int total) {
+      if (total == 0) return;
+      Serial.printf("[OTA] %u%%\r", (unsigned)((progress * 100) / total));
+    })
+    .onError([](ota_error_t error) {
+      Serial.printf("[OTA] error %u\n", (unsigned)error);
+    });
+  ArduinoOTA.begin();
+  if (OTA_UPLOAD_PASSWORD != nullptr && OTA_UPLOAD_PASSWORD[0] != '\0') {
+    Serial.println("[OTA] password required for upload");
+  }
+  Serial.println("[OTA] listening — use IDE network port \"clock-beta\"");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // Network Task (Core 0)
 // ═════════════════════════════════════════════════════════════════════════════
 void networkTask(void *pvParameters) {
@@ -447,12 +480,14 @@ void networkTask(void *pvParameters) {
       lastWifiCheck = millis();
       if (!wifiOK) {
         Serial.println("WiFi lost. Reconnecting...");
-        WiFi.disconnect(true);
-        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        WiFi.disconnect(false);
+        delay(200);
+        WiFi.begin();  // uses credentials saved by WiFiManager
       }
     }
 
     if (wifiOK) {
+      ArduinoOTA.handle();
       unsigned long ntpInt = ntpSynced ? 60000UL : 10000UL;
       if (millis() - lastNtpSync > ntpInt) {
         lastNtpSync = millis();
@@ -603,27 +638,31 @@ void setup() {
     bootSplash(mat1, " No RTC  NTP only ");
   }
 
-  // ── WiFi ──────────────────────────────────────────────────────────────────
+  // ── WiFi (WiFiManager: portal AP "ClockSetup" if needed) ──────────────────
   bootSplash(mat1, " Connecting WiFi... ");
 
   WiFi.mode(WIFI_STA);
-  WiFi.disconnect(true); delay(100);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  // do not use disconnect(true) here — it wipes saved STA credentials on ESP32
+  delay(100);
 
-  unsigned long wStart = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wStart < WIFI_TIMEOUT) {
-    delay(500);
-    Serial.print(".");
+  WiFiManager wm;
+  wm.setConnectTimeout(WIFI_TIMEOUT / 1000);       // seconds per STA connect attempt
+  wm.setConfigPortalTimeout(WIFI_PORTAL_SEC);     // seconds; then give up and boot offline
+
+  bool gotWifi = false;
+  if (WIFI_AP_PASSWORD != nullptr && WIFI_AP_PASSWORD[0] != '\0') {
+    gotWifi = wm.autoConnect(WIFI_AP_NAME, WIFI_AP_PASSWORD);
+  } else {
+    gotWifi = wm.autoConnect(WIFI_AP_NAME);
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
+  if (gotWifi && WiFi.status() == WL_CONNECTED) {
     wifiConnected = true;
     int rssi = WiFi.RSSI();
     Serial.println("\nWiFi OK: " + WiFi.localIP().toString() + " (RSSI: " + String(rssi) + "dBm)");
-    
+
     bootSplash(mat1, " WiFi OK ");
-    
-    // Show WiFi signal strength
+
     char signalMsg[32];
     if (rssi > -50) {
       snprintf(signalMsg, sizeof(signalMsg), " Signal: Excellent ");
@@ -637,13 +676,15 @@ void setup() {
     bootSplash(mat2, signalMsg);
     Serial.println("WiFi Signal: " + String(rssi) + " dBm");
 
+    beginArduinoOTA();
+
     timeClient.begin();
     Serial.println("Starting NTP sync...");
     bootSplash(mat1, " Syncing NTP... ");
-    syncRTC();  // Pre-sync RTC from NTP before messages start processing (FIX: ensures time is current)
+    syncRTC();
     bootSplash(mat2, " NTP OK  Ready! ");
   } else {
-    Serial.println("\nWiFi timeout!");
+    Serial.println("\nWiFi timeout or portal closed without connection.");
     bootSplash(mat1, " No WiFi!  Offline ");
     bootSplash(mat2, " NTP Only Mode ");
   }
